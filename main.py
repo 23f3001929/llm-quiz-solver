@@ -76,6 +76,11 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                - If the question asks for the email or secret, use the Context Data above.
                - If the question asks to extract a value (like a code or name), extract it exactly.
             
+            CRITICAL RULES FOR ANSWERING:
+            - If the question asks for "your email", the answer MUST be "{email}".
+            - If the question asks for "your secret", the answer MUST be "{student_secret}".
+            - Do NOT return the string "your secret". Return the actual value.
+            
             Return ONLY a JSON object in this exact format:
             {{
                 "submission_url": "...",
