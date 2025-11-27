@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 requests
-playwright
+playwright==1.48.0
 openai
 python-dotenv
 pydantic
