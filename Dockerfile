@@ -1,7 +1,7 @@
-# UPDATE: Using the newer version 1.56.0 as requested by the error
+
 FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
-# Set the working directory inside the container
+
 WORKDIR /app
 
 # Copy the requirements file
@@ -15,7 +15,7 @@ COPY . .
 
 # Run the application using the PORT variable provided by Render
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]# UPDATE: Using the newer version 1.56.0 as requested by the error
-FROM mcr.microsoft.com/playwright/python:v1.56.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
 # Set the working directory inside the container
 WORKDIR /app
