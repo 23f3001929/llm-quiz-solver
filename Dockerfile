@@ -1,19 +1,18 @@
-
+# Use the stable Playwright image
 FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
-
+# Set work directory
 WORKDIR /app
 
-# Copy the requirements file
-COPY requirements.txt .
+# CRITICAL: Install ffmpeg for audio conversion
+RUN apt-get update && apt-get install -y ffmpeg
 
-# Install the Python libraries
+# Copy requirements and install dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of your code
+# Copy the rest of the code
 COPY . .
 
-# Run the application using the PORT variable provided by Render
+# Start the server
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
-
-# UPDATE: Using the newer version 1.56.0 as requested by the error

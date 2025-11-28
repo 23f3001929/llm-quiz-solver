@@ -1,24 +1,28 @@
 import os
 import json
-import time
-import base64
 import re
+import asyncio
+import requests
+import tempfile
+import time
 from urllib.parse import urljoin, urlparse
 
-import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from openai import OpenAI
+import speech_recognition as sr
+from pydub import AudioSegment
 
 # ==========================================
-# CONFIG
+# CONFIGURATION
 # ==========================================
 load_dotenv()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 MY_SECRET = os.getenv("MY_SECRET")
 
+# We still use the proxy for Chat, but NOT for Audio
 client = OpenAI(api_key=AIPIPE_TOKEN, base_url="https://aipipe.org/openai/v1")
 app = FastAPI()
 
@@ -28,131 +32,79 @@ class QuizRequest(BaseModel):
     url: str
 
 # ==========================================
-# UTILITIES
+# TOOLKIT
 # ==========================================
-def mask_secret(s: str) -> str:
-    """Masks secret for LOGGING only. Do not use for the actual Prompt."""
-    if not s:
-        return ""
-    return s[:2] + "***" if len(s) > 3 else "***"
 
-def extract_numbers_from_text(text: str):
+async def process_audio_google(url: str) -> str:
     """
-    Extract ints/floats from text (handles thousands separators).
-    """
-    if not text:
-        return []
-    # Remove commas used as thousands separators
-    cleaned = re.sub(r'(?<=\d),(?=\d{3}\b)', '', text)
-    # Find numbers (integers or floats)
-    tokens = re.findall(r'-?\d+(?:\.\d+)?', cleaned)
-    nums = []
-    for t in tokens:
-        try:
-            if '.' in t:
-                nums.append(float(t))
-            else:
-                nums.append(int(t))
-        except:
-            pass
-    return nums
-
-def clean_json_string(s: str) -> str:
-    """Removes markdown code blocks if the AI adds them."""
-    if "```json" in s:
-        s = s.split("```json")[1].split("```")[0]
-    elif "```" in s:
-        s = s.split("```")[1].split("```")[0]
-    return s.strip()
-
-def page_looks_for_secret(page_text: str, evidence: str) -> bool:
-    """
-    Heuristic: Checks if the page is explicitly asking for credentials.
-    """
-    s = (page_text or "") + "\n" + (evidence or "")
-    s = s.lower()
-    keywords = [
-        "enter your secret", "your secret", "student secret", "enter secret",
-        "secret code", "provide secret", "enter code", "password:", "auth code"
-    ]
-    if any(kw in s for kw in keywords):
-        return True
-    return False
-
-# ==========================================
-# FILE PROCESSING TOOLS
-# ==========================================
-async def process_audio_url(url: str) -> str:
-    """
-    Try multipart upload first (best for proxies), then JSON base64 fallback.
+    Downloads audio, converts to WAV, and uses Google Speech Recognition.
+    This Bypasses the AI Pipe Proxy entirely to avoid 400 Errors.
     """
     print(f"    [Tool] 🔊 Found Audio: {url}")
     try:
-        resp = requests.get(url, timeout=20)
-        if 'text/html' in resp.headers.get('Content-Type', ''):
-            print("    [Tool] Audio URL returned HTML, skipping.")
-            return ""
-
-        audio_bytes = resp.content
-        headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}"}
-
-        # Attempt 1: Multipart (model param in query + data) - Most Robust for AI Pipe
-        transcription_url = "https://aipipe.org/openai/v1/audio/transcriptions?model=whisper-1"
-        files = {"file": ("audio.opus", audio_bytes, "application/octet-stream")}
-        data = {"model": "whisper-1"}
-
-        print("    [Tool] Whisper Attempt 1: Multipart")
-        r = requests.post(transcription_url, headers=headers, files=files, data=data, timeout=60)
-
-        if r.status_code == 200:
-            text = r.json().get("text", "")
-            print(f"    [Tool] Transcription OK: {text[:80]}...")
-            return text
-
-        # Attempt 2: JSON with base64 file (Fallback)
-        print("    [Tool] Whisper Attempt 1 failed; Attempt 2: JSON base64")
-        b64 = base64.b64encode(audio_bytes).decode("ascii")
-        payload = {
-            "model": "whisper-1", 
-            "file_b64": b64, 
-            "filename": "audio.mp3"
-        }
-
-        r2 = requests.post("https://aipipe.org/openai/v1/audio/transcriptions", headers=headers, json=payload, timeout=60)
-
-        if r2.status_code == 200:
-            text = r2.json().get("text", "")
-            print(f"    [Tool] Transcription OK (base64): {text[:80]}...")
-            return text
-
-        print(f"    [Tool] All Whisper attempts failed. Status: {r.status_code} / {r2.status_code}")
-        return ""
+        # 1. Download
+        resp = requests.get(url, timeout=30)
+        if 'text/html' in resp.headers.get('Content-Type', ''): return ""
+        
+        # 2. Convert to WAV (Google requires WAV)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Save original file (likely .opus or .mp3)
+            orig_path = os.path.join(temp_dir, "original_audio")
+            with open(orig_path, "wb") as f:
+                f.write(resp.content)
+            
+            # Convert to WAV using pydub + ffmpeg
+            wav_path = os.path.join(temp_dir, "converted.wav")
+            audio = AudioSegment.from_file(orig_path)
+            audio.export(wav_path, format="wav")
+            
+            # 3. Transcribe with Google Web Speech API (Free)
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source)
+                text = recognizer.recognize_google(audio_data)
+                
+            print(f"    [Tool] Google Transcription: {text[:50]}...")
+            return f"\n[AUDIO TRANSCRIPT]\n{text}\n"
 
     except Exception as e:
-        print("    [Tool] Audio Exception:", e)
+        print(f"    [Tool] Audio Error: {e}")
         return ""
-
 
 async def process_csv_url(url: str) -> str:
-    print(f"    [Tool] 📊 Found CSV/Data: {url}")
+    print(f"    [Tool] 📊 Found CSV: {url}")
     try:
-        r = requests.get(url, timeout=20)
-        if 'text/html' in r.headers.get('Content-Type', ''):
-            print("    [Tool] CSV URL returned HTML, skipping.")
-            return ""
+        r = requests.get(url, timeout=15)
+        if 'text/html' in r.headers.get('Content-Type', ''): return ""
         content = r.content.decode("utf-8", errors="replace")
-        print(f"    [Tool] CSV length: {len(content)} chars")
-        return content
+        return f"\n[CSV CONTENT]\n{content}\n"
     except Exception as e:
-        print("    [Tool] CSV Error:", e)
         return ""
 
+def extract_secret_from_page(text: str) -> str:
+    """
+    Uses Regex to find codes like 'The secret is 1234' if the AI is too lazy to look.
+    """
+    patterns = [
+        r"secret\s+(?:code\s+)?(?:is|:)\s*([A-Za-z0-9]+)", # "secret is XYZ"
+        r"code\s+(?:is|:)\s*([A-Za-z0-9]+)",               # "code is XYZ"
+        r"cutoff\s+(?:is|:)\s*(\d+)"                       # "cutoff is 123"
+    ]
+    for p in patterns:
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+def extract_numbers(text: str):
+    """Finds all numbers in text for math summing."""
+    return [float(x) for x in re.findall(r'-?\d+\.?\d*', text.replace(',', ''))]
+
 # ==========================================
-# MAIN SOLVER
+# MAIN LOGIC
 # ==========================================
 async def solve_quiz_task(task_url: str, email: str, student_secret: str):
-    if not task_url:
-        return
+    if not task_url: return
     print(f"\n[+] Processing Task: {task_url}")
 
     async with async_playwright() as p:
@@ -162,203 +114,125 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
         try:
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
-
             page_text = await page.evaluate("document.body.innerText")
-            
-            # Extract links and media sources
+
+            # Get Links directly from DOM
             media_links = await page.evaluate("""() => {
                 let links = [];
-                document.querySelectorAll('a').forEach(a => { if (a.href) links.push({url: a.href, type: 'link'}) });
-                document.querySelectorAll('audio, source').forEach(el => { if (el.src) links.push({url: el.src, type: 'audio'}) });
+                document.querySelectorAll('a').forEach(a => { if (a.href) links.push(a.href) });
+                document.querySelectorAll('audio, source').forEach(el => { if (el.src) links.push(el.src) });
                 return links;
             }""")
 
-            evidence_log = ""
-            processed_urls = set()
-            csv_contents = ""
-            audio_transcripts = []
-
-            # Download and Process Files
-            for item in media_links:
-                url = item['url']
-                if not url or url in processed_urls or url.rstrip('/') == task_url.rstrip('/'):
-                    continue
-
-                processed_urls.add(url)
+            evidence = ""
+            csv_nums = []
+            
+            # Download Loop
+            seen = set()
+            for url in media_links:
+                if url in seen or url.rstrip('/') == task_url.rstrip('/'): continue
+                seen.add(url)
                 
                 # Check for Audio
-                if url.lower().endswith(('.mp3', '.wav', '.opus')) or item['type'] == 'audio':
-                    t = await process_audio_url(url)
-                    if t:
-                        audio_transcripts.append(t)
-                        evidence_log += f"\n[AUDIO TRANSCRIPT FROM {url}]\n{t}\n"
+                if any(x in url.lower() for x in ['.mp3', '.wav', '.opus', 'audio']):
+                    evidence += await process_audio_google(url)
                 
                 # Check for CSV
-                elif url.lower().endswith('.csv') or ('csv' in url.lower() and 'download' in url.lower()):
-                    c = await process_csv_url(url)
-                    if c:
-                        csv_contents += c
-                        evidence_log += f"\n[CSV FILE CONTENT FROM {url}]\n{c}\n"
+                elif 'csv' in url.lower() or 'download' in url.lower():
+                    csv_text = await process_csv_url(url)
+                    if csv_text:
+                        evidence += csv_text
+                        csv_nums = extract_numbers(csv_text)
 
-            # -------------------------
-            # AI DECISION
-            # -------------------------
-            system_msg = (
-                "You are a strict JSON quiz-solving agent. Output valid JSON only."
+            # --- SMART LOGIC ---
+            
+            # 1. Regex Search (Fixes Level 2 "Lazy AI")
+            extracted_code = extract_secret_from_page(page_text)
+            
+            # 2. Math Calculation (Fixes Level 3 "Wrong Sum")
+            # If CSV exists, sum it.
+            math_answer = None
+            if csv_nums:
+                math_answer = sum(csv_nums)
+                # Convert to int if it's a whole number (e.g., 50.0 -> 50)
+                if math_answer.is_integer(): math_answer = int(math_answer)
+            
+            # 3. AI Prompt
+            prompt = f"""
+            You are a Quiz Solver.
+            
+            INTERNAL CREDENTIALS:
+            - EMAIL: "{email}"
+            - SECRET: "{student_secret}"
+            
+            AUTO-DETECTED CLUES:
+            - Found on Page: {extracted_code if extracted_code else "None"}
+            - Calculated CSV Sum: {math_answer if math_answer else "None"}
+            
+            EVIDENCE:
+            {evidence}
+            
+            PAGE TEXT:
+            {page_text}
+            
+            TASK: 
+            1. Find submission URL.
+            2. Answer the question.
+            
+            RULES:
+            - IDENTITY: If asked for "your secret/email", use INTERNAL CREDENTIALS.
+            - SCRAPING: If asked for a specific code on the page, use the 'Found on Page' value if valid, or find it in the text.
+            - MATH: If asked to sum numbers, prefer the 'Calculated CSV Sum'.
+            
+            Return JSON:
+            {{ "submission_url": "...", "payload": {{ "email": "{email}", "secret": "{student_secret}", "url": "{task_url}", "answer": <value> }} }}
+            """
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
             )
-
-            # NOTE: We send the ACTUAL secret to the AI so it can output it if asked.
-            # We rely on the Prompt Instructions to tell it when to use it.
-            user_msg = f"""
-INTERNAL DATA:
-EMAIL: {email}
-SECRET: {student_secret}
-
-EVIDENCE:
-{evidence_log}
-
-PAGE TEXT:
-{page_text}
-
-TASK:
-1. Find the "submission_url" on the page.
-2. Answer the question.
-
-RULES:
-- IDENTITY: If asked for "your secret", "password", or "email", use the INTERNAL DATA values.
-- SCRAPING: If the text says "The secret code is XYZ", use "XYZ".
-- MATH: If asked to sum numbers, use the EVIDENCE data.
-
-Return valid JSON:
-{{ "submission_url": "...", "payload": {{ "email": "{email}", "secret": "{student_secret}", "url": "{task_url}", "answer": <value> }} }}
-"""
-
-            try:
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg}
-                    ],
-                    temperature=0,
-                    response_format={"type": "json_object"}
-                )
-            except Exception as e:
-                print("    [AI] Model call error:", e)
-                response = None
-
-            ai_payload = {}
-            submission_url = None
             
-            if response:
-                raw_content = response.choices[0].message.content
-                try:
-                    # Clean markdown if present
-                    clean_raw = clean_json_string(raw_content)
-                    ai_json = json.loads(clean_raw)
-                    submission_url = ai_json.get("submission_url")
-                    ai_payload = ai_json.get("payload", {})
-                except Exception:
-                    print("    [AI] JSON Parse Error. Raw:", raw_content[:100])
+            ai_data = json.loads(response.choices[0].message.content)
+            submission_url = ai_data.get("submission_url")
+            payload = ai_data.get("payload")
 
-            # Prepare Payload
-            payload = {
-                "email": email,
-                "secret": student_secret,
-                "url": task_url,
-                "answer": ai_payload.get("answer")
-            }
+            # Final Cleanup
+            if submission_url and not submission_url.startswith("http"):
+                submission_url = urljoin(task_url, submission_url)
+            
+            # Safety Net: If AI missed the regex code, force it
+            if extracted_code and "your secret" in str(payload.get("answer", "")).lower():
+                payload["answer"] = extracted_code
 
-            # -------------------------
-            # MATH VERIFICATION (Local)
-            # -------------------------
-            # Only use CSV numbers if CSV is present to avoid summing page dates/garbage.
-            numbers_in_csv = extract_numbers_from_text(csv_contents) if csv_contents else []
-            numbers_in_audio = []
-            for t in audio_transcripts:
-                numbers_in_audio.extend(extract_numbers_from_text(t))
-            
-            # Check for calculation keywords
-            calc_keywords = r'\b(sum|total|add|calculate|count)\b'
-            is_calculation = re.search(calc_keywords, page_text.lower())
-
-            used_local_calc = False
-            
-            # Logic: If CSV exists and calculation is asked, sum CSV.
-            if numbers_in_csv and is_calculation:
-                local_sum = sum(numbers_in_csv)
-                payload["answer"] = int(local_sum) if isinstance(local_sum, float) and local_sum.is_integer() else local_sum
-                used_local_calc = True
-                print(f"    [Verify] Overriding AI with CSV Sum: {payload['answer']}")
-            
-            # Fallback: If no CSV but Audio exists and calculation is asked, sum Audio numbers.
-            elif not numbers_in_csv and numbers_in_audio and is_calculation:
-                local_sum = sum(numbers_in_audio)
-                payload["answer"] = int(local_sum) if isinstance(local_sum, float) and local_sum.is_integer() else local_sum
-                used_local_calc = True
-                print(f"    [Verify] Overriding AI with Audio Sum: {payload['answer']}")
-
-            # -------------------------
-            # SECRET VERIFICATION (Safety Net)
-            # -------------------------
-            # If AI returned a placeholder text like "your secret", swap it manually.
-            raw_ans_str = str(payload["answer"]).lower()
-            placeholders = ["your secret", "my secret", "student secret", "anything you want"]
-            
-            if any(ph in raw_ans_str for ph in placeholders):
-                if page_looks_for_secret(page_text, evidence_log):
-                    print("    ⚠️ AI returned placeholder. Swapping with actual secret.")
+            # Safety Net: If AI missed the credentials
+            if "your secret" in str(payload.get("answer", "")).lower():
+                # Check context to see if we should swap
+                if "secret" in page_text.lower() and "input" in page_text.lower():
                     payload["answer"] = student_secret
 
-            # URL Cleanup
-            if submission_url:
-                if not str(submission_url).startswith("http"):
-                    submission_url = urljoin(task_url, submission_url)
-            else:
-                # Default fallback
-                parsed = urlparse(task_url)
-                submission_url = f"{parsed.scheme}://{parsed.netloc}/submit"
-
-            payload["url"] = task_url
-            
-            print(f"    Final Answer: {payload.get('answer')}")
+            print(f"    AI Answer: {payload.get('answer')}")
             print(f"    Submitting to: {submission_url}")
 
-            # -------------------------
-            # SUBMIT
-            # -------------------------
-            try:
-                submit_res = requests.post(submission_url, json=payload, timeout=30)
-                res_json = submit_res.json()
-                print("    Server:", res_json)
-
-                if res_json.get("correct") == True:
-                    print("    ✅ Correct!")
-                    if res_json.get("url"):
-                        await browser.close()
-                        await solve_quiz_task(res_json["url"], email, student_secret)
-                elif res_json.get("url"):
-                    print("    ❌ Incorrect. Retrying next URL...")
+            if submission_url:
+                res = requests.post(submission_url, json=payload).json()
+                print("    Server:", res)
+                
+                # RECURSION
+                if res.get("url"):
                     await browser.close()
-                    await solve_quiz_task(res_json["url"], email, student_secret)
-                else:
-                    print("    🛑 Game Over.")
-            except Exception as e:
-                print("    ❌ Submit Error:", e)
+                    await solve_quiz_task(res["url"], email, student_secret)
 
         except Exception as e:
-            print("    Page Error:", e)
-
+            print("    Error:", e)
+        
         if browser.is_connected():
             await browser.close()
 
-# ==========================================
-# API
-# ==========================================
 @app.post("/run")
 async def run_task(request: QuizRequest, background_tasks: BackgroundTasks):
     if request.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
-
     background_tasks.add_task(solve_quiz_task, request.url, request.email, request.secret)
     return {"message": "Task started", "status": "processing"}
