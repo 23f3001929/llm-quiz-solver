@@ -19,6 +19,7 @@ load_dotenv()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 MY_SECRET = os.getenv("MY_SECRET")
 
+# Initialize OpenAI Client
 client = OpenAI(
     api_key=AIPIPE_TOKEN,
     base_url="https://aipipe.org/openai/v1"
@@ -44,12 +45,13 @@ async def transcribe_audio_file(file_url: str, task_url: str) -> str:
     
     # 1. Download file content
     try:
+        # Use simple requests for file downloads
         response = requests.get(file_url, stream=True, timeout=15)
         response.raise_for_status()
     except Exception as e:
         return f"ERROR: Could not download audio file: {e}"
 
-    # 2. Save file temporarily (OpenAI needs a file path)
+    # 2. Save file temporarily
     with tempfile.TemporaryDirectory() as temp_dir:
         file_name = f"audio_{int(time.time())}.mp3"
         temp_filepath = os.path.join(temp_dir, file_name)
@@ -65,7 +67,7 @@ async def transcribe_audio_file(file_url: str, task_url: str) -> str:
                     model="whisper-1", 
                     file=audio_file
                 )
-            transcribed_text = transcription.text
+            transcribed_text = transcription.text.strip()
             print(f"    [Tool] Transcription successful. Text length: {len(transcribed_text)}")
             return transcribed_text
 
@@ -92,11 +94,11 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, additi
             content = await page.evaluate("document.body.innerText")
             print(f"    Scraped content length: {len(content)} chars")
 
-            # B. Check if audio needs to be processed (Agent Loop)
-            if "audio" in content.lower() or ".mp3" in content.lower():
+            # B. AGENT LOOP: Check if audio needs to be processed
+            if additional_context is None and ("audio" in content.lower() or ".mp3" in content.lower()):
                 # Step 1: LLM extracts audio URL
                 audio_url_prompt = f"""
-                Analyze the following webpage content. Your only task is to extract the full URL of any downloadable audio file or the link mentioned next to 'Download file'.
+                Analyze the following webpage content. Extract the URL of any downloadable audio file or the link mentioned next to 'Download file'.
                 WEBPAGE CONTENT: '''{content}'''
                 Return ONLY the URL as a plain string. If no clear URL is found, return 'NONE'.
                 """
@@ -113,18 +115,25 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, additi
 
                     # Step 2: Recurse/Rerun with new context
                     if transcription.startswith("ERROR"):
-                         additional_context = f"Media Error: {transcription}"
+                         context_payload = f"Media Error: {transcription}"
                     else:
-                         # Important: Add the transcribed text as context for the next LLM call
-                         additional_context = f"Media Transcription: {transcription}"
+                         context_payload = f"Media Transcription: {transcription}"
                          
                     print(f"    [Agent] Rerunning analysis with transcription context.")
                     await browser.close()
                     # Rerun the solver with the new context
-                    await solve_quiz_task(task_url, email, student_secret, additional_context)
+                    await solve_quiz_task(task_url, email, student_secret, context_payload)
                     return
 
-            # C. Universal Solver Prompt (Final Decision)
+            # C. Build the Context Block (Clean Syntax Fix)
+            context_block = ""
+            if additional_context:
+                context_block = f"""
+--- NEW CONTEXT (From Audio/Media) ---
+{additional_context}
+"""
+            
+            # D. Universal Solver Prompt (Final Decision)
             full_prompt = f"""
             You are an automated data extraction assistant.
             
@@ -134,7 +143,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, additi
             - My Secret Code: "{student_secret}"
             --------------------------------------------------
             
-            {"--- NEW CONTEXT (From Audio/Media) ---\n" + additional_context if additional_context else ""}
+            {context_block}
             
             WEBPAGE CONTENT:
             '''
@@ -163,14 +172,14 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, additi
             }}
             """
 
-            # D. Get Final Decision
+            # E. Get Final Decision
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": full_prompt}],
                 response_format={"type": "json_object"}
             )
 
-            # E. Parse and Submit
+            # F. Parse and Submit
             ai_data = json.loads(response.choices[0].message.content)
             submission_url = get_full_file_url(task_url, ai_data.get("submission_url"))
             payload = ai_data.get("payload")
@@ -180,17 +189,18 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, additi
 
             if submission_url:
                 submit_response = requests.post(submission_url, json=payload)
-                # ... (submission and recursion logic is the same) ...
                 try:
                     result = submit_response.json()
                     print(f"    Server Response: {result}")
 
+                    # If Correct -> Recurse
                     if result.get("correct") == True and "url" in result:
                         print("    ✅ Answer Correct! Moving to next level...")
                         await browser.close()
                         await solve_quiz_task(result["url"], email, student_secret)
                         return
                     
+                    # If Incorrect but a URL is offered (Skip/Next Logic)
                     elif "url" in result:
                          print("    ⚠️ Answer rejected, but proceeding to next URL...")
                          await browser.close()
