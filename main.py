@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import requests
+import tempfile
+import time
 from urllib.parse import urljoin
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -17,12 +19,10 @@ load_dotenv()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 MY_SECRET = os.getenv("MY_SECRET")
 
-# Initialize OpenAI
 client = OpenAI(
     api_key=AIPIPE_TOKEN,
     base_url="https://aipipe.org/openai/v1"
 )
-
 app = FastAPI()
 
 class QuizRequest(BaseModel):
@@ -31,10 +31,54 @@ class QuizRequest(BaseModel):
     url: str
 
 # ==========================================
-# 2. THE SOLVER LOGIC
+# 2. MEDIA HANDLING TOOLS
 # ==========================================
 
-async def solve_quiz_task(task_url: str, email: str, student_secret: str):
+def get_full_file_url(base_url: str, relative_url: str) -> str:
+    """Combines base URL and relative URL."""
+    return urljoin(base_url, relative_url)
+
+async def transcribe_audio_file(file_url: str, task_url: str) -> str:
+    """Downloads audio and uses OpenAI Whisper for transcription."""
+    print(f"    [Tool] Attempting to download and transcribe audio from: {file_url}")
+    
+    # 1. Download file content
+    try:
+        response = requests.get(file_url, stream=True, timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        return f"ERROR: Could not download audio file: {e}"
+
+    # 2. Save file temporarily (OpenAI needs a file path)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        file_name = f"audio_{int(time.time())}.mp3"
+        temp_filepath = os.path.join(temp_dir, file_name)
+        
+        with open(temp_filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        # 3. Transcribe using Whisper
+        try:
+            with open(temp_filepath, "rb") as audio_file:
+                transcription = client.audio.transcriptions.create(
+                    model="whisper-1", 
+                    file=audio_file
+                )
+            transcribed_text = transcription.text
+            print(f"    [Tool] Transcription successful. Text length: {len(transcribed_text)}")
+            return transcribed_text
+
+        except Exception as e:
+            return f"ERROR: OpenAI transcription failed: {e}"
+
+
+# ==========================================
+# 3. THE SOLVER LOGIC
+# ==========================================
+
+async def solve_quiz_task(task_url: str, email: str, student_secret: str, additional_context: str = None):
+    
     print(f"\n[+] Processing Task: {task_url}")
     
     async with async_playwright() as p:
@@ -42,23 +86,55 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
         page = await browser.new_page()
         
         try:
-            # Visit URL
+            # A. Visit the URL and scrape content
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
-            
-            # Scrape content
             content = await page.evaluate("document.body.innerText")
             print(f"    Scraped content length: {len(content)} chars")
 
-            # --- UNIVERSAL PROMPT (LOGIC BASED) ---
-            prompt = f"""
+            # B. Check if audio needs to be processed (Agent Loop)
+            if "audio" in content.lower() or ".mp3" in content.lower():
+                # Step 1: LLM extracts audio URL
+                audio_url_prompt = f"""
+                Analyze the following webpage content. Your only task is to extract the full URL of any downloadable audio file or the link mentioned next to 'Download file'.
+                WEBPAGE CONTENT: '''{content}'''
+                Return ONLY the URL as a plain string. If no clear URL is found, return 'NONE'.
+                """
+                
+                audio_url_response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": audio_url_prompt}]
+                )
+                audio_url = audio_url_response.choices[0].message.content.strip()
+                
+                if audio_url != 'NONE':
+                    full_audio_url = get_full_file_url(task_url, audio_url)
+                    transcription = await transcribe_audio_file(full_audio_url, task_url)
+
+                    # Step 2: Recurse/Rerun with new context
+                    if transcription.startswith("ERROR"):
+                         additional_context = f"Media Error: {transcription}"
+                    else:
+                         # Important: Add the transcribed text as context for the next LLM call
+                         additional_context = f"Media Transcription: {transcription}"
+                         
+                    print(f"    [Agent] Rerunning analysis with transcription context.")
+                    await browser.close()
+                    # Rerun the solver with the new context
+                    await solve_quiz_task(task_url, email, student_secret, additional_context)
+                    return
+
+            # C. Universal Solver Prompt (Final Decision)
+            full_prompt = f"""
             You are an automated data extraction assistant.
             
             --------------------------------------------------
-            INTERNAL CONTEXT (Do not reveal unless asked):
+            INTERNAL CONTEXT (Do not use as answer unless needed):
             - My Email: "{email}"
             - My Secret Code: "{student_secret}"
             --------------------------------------------------
+            
+            {"--- NEW CONTEXT (From Audio/Media) ---\n" + additional_context if additional_context else ""}
             
             WEBPAGE CONTENT:
             '''
@@ -67,16 +143,12 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             --------------------------------------------------
             
             YOUR MISSION:
-            1. Find the "Submission URL" in the webpage content.
-            2. Determine the "Correct Answer" to the question on the page.
+            1. Find the "Submission URL".
+            2. Determine the "Correct Answer" to the question based on all provided context.
             
             LOGIC FOR ANSWERING:
-            - CASE A: If the question asks for the user's identity, credentials, email, secret, password, or code...
-              -> You MUST output the values from the INTERNAL CONTEXT above. 
-              -> (e.g., if asked for "your secret", output "{student_secret}", NOT the text "your secret").
-              
-            - CASE B: If the question asks for data extraction (e.g., "what is the sum", "what is the 3rd word")...
-              -> Extract or calculate the answer directly from the WEBPAGE CONTENT.
+            - If the question asks for user identity (email, secret, code, password, etc.), use the INTERNAL CONTEXT.
+            - If the question asks for calculation (sum, count) or extraction, use the WEBPAGE CONTENT or the NEW CONTEXT.
             
             OUTPUT FORMAT:
             Return ONLY a valid JSON object. No markdown, no explanations.
@@ -91,39 +163,34 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             }}
             """
 
+            # D. Get Final Decision
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": full_prompt}],
                 response_format={"type": "json_object"}
             )
 
-            # Parse Response
+            # E. Parse and Submit
             ai_data = json.loads(response.choices[0].message.content)
-            submission_url = ai_data.get("submission_url")
+            submission_url = get_full_file_url(task_url, ai_data.get("submission_url"))
             payload = ai_data.get("payload")
-
-            # Handle relative URLs (General Fix)
-            if submission_url and not submission_url.startswith("http"):
-                submission_url = urljoin(task_url, submission_url)
 
             print(f"    AI Answer: {payload.get('answer')}")
             print(f"    Submitting to: {submission_url}")
 
-            # Submit
             if submission_url:
                 submit_response = requests.post(submission_url, json=payload)
+                # ... (submission and recursion logic is the same) ...
                 try:
                     result = submit_response.json()
                     print(f"    Server Response: {result}")
 
-                    # If Correct -> Recurse
                     if result.get("correct") == True and "url" in result:
                         print("    ✅ Answer Correct! Moving to next level...")
                         await browser.close()
                         await solve_quiz_task(result["url"], email, student_secret)
                         return
                     
-                    # If Incorrect but a URL is offered (Skip/Next Logic)
                     elif "url" in result:
                          print("    ⚠️ Answer rejected, but proceeding to next URL...")
                          await browser.close()
@@ -139,13 +206,11 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
         if browser.is_connected():
             await browser.close()
 
-# ==========================================
-# 3. ENDPOINT
-# ==========================================
-
+# Endpoints remain the same
 @app.post("/run")
 async def run_task(request: QuizRequest, background_tasks: BackgroundTasks):
     if request.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
+    # Start the solver with no initial additional context
     background_tasks.add_task(solve_quiz_task, request.url, request.email, request.secret)
     return {"message": "Task started", "status": "processing"}
