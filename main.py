@@ -4,7 +4,7 @@ import asyncio
 import requests
 import tempfile
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -38,7 +38,6 @@ async def process_audio_url(url: str) -> str:
     print(f"    [Tool] 🔊 Found Audio: {url}")
     try:
         response = requests.get(url, stream=True, timeout=15)
-        # Security: Ignore if it downloads a webpage instead of audio
         if 'text/html' in response.headers.get('Content-Type', ''): return "" 
         
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -48,7 +47,6 @@ async def process_audio_url(url: str) -> str:
                     f.write(chunk)
             
             with open(path, "rb") as audio_file:
-                # Use Whisper to transcribe
                 transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
             print(f"    [Tool] Transcription: {transcript.text[:50]}...")
             return f"\n[AUDIO TRANSCRIPT FROM {url}]\n{transcript.text}\n"
@@ -60,7 +58,6 @@ async def process_csv_url(url: str) -> str:
     print(f"    [Tool] 📊 Found CSV/Data: {url}")
     try:
         response = requests.get(url, timeout=15)
-        # Security: Ignore if it downloads a webpage
         if 'text/html' in response.headers.get('Content-Type', ''): return ""
         
         content = response.content.decode('utf-8')
@@ -83,38 +80,34 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
         page = await browser.new_page()
         
         try:
-            # 1. NAVIGATE & WAIT
+            # 1. NAVIGATE
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
             
-            # 2. INTELLIGENT SCRAPING (Code-based, not AI-based)
-            # We extract links directly from DOM to ensure we don't miss anything.
+            # 2. EXTRACT CONTENT
             page_text = await page.evaluate("document.body.innerText")
             
-            # Extract hrefs for CSVs and SRCs for Audio using JavaScript
+            # 3. CHECK FOR FILES (Code-based detection)
+            # We look for links to CSVs or Audio sources
             media_links = await page.evaluate("""() => {
                 let links = [];
-                // Get all Anchor tags
                 document.querySelectorAll('a').forEach(a => {
                     if (a.href) links.push({url: a.href, type: 'link'});
                 });
-                // Get all Audio tags
                 document.querySelectorAll('audio, source').forEach(el => {
                     if (el.src) links.push({url: el.src, type: 'audio'});
                 });
                 return links;
             }""")
 
-            # 3. GATHER EVIDENCE (Download Loop)
             evidence_log = ""
             processed_urls = set()
             
             for item in media_links:
                 url = item['url']
-                # Skip if already processed or if it's the current page itself
                 if url in processed_urls or url.rstrip('/') == task_url.rstrip('/'): continue
                 
-                # Heuristics to decide what to download
+                # Filter for relevant files
                 is_audio = item['type'] == 'audio' or url.endswith('.mp3') or url.endswith('.wav')
                 is_csv = url.endswith('.csv') or 'csv' in url.lower() or 'download' in url.lower()
                 
@@ -122,38 +115,45 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                     evidence_log += await process_audio_url(url)
                     processed_urls.add(url)
                 elif is_csv:
-                    # Double check it's not a navigation link
                     if not url.endswith('.html') and '/page/' not in url:
                         evidence_log += await process_csv_url(url)
                         processed_urls.add(url)
 
-            # 4. THE BRAIN (LLM SOLVER)
-            # We give the LLM a strong persona to fix the Secret/Email issue.
+            # 4. THE BRAIN (Revised Prompt)
             prompt = f"""
-            You are the user with the following credentials:
+            You are a precise data extraction agent.
+            
+            USER IDENTITY (Use ONLY if asked for "your" credentials):
             - EMAIL: "{email}"
             - SECRET: "{student_secret}"
             
-            You are solving a quiz. 
+            TASK:
+            1. Analyze the PAGE TEXT and EVIDENCE below.
+            2. Extract the Submission URL (it might be a relative path like /submit).
+            3. Answer the question.
             
-            EVIDENCE COLLECTED:
+            EVIDENCE (Audio/Files):
             {evidence_log}
             
-            WEBPAGE TEXT:
+            PAGE TEXT:
             '''
             {page_text}
             '''
             
-            INSTRUCTIONS:
-            1. Parse the page to find the Submission JSON format and URL.
-            2. Answer the question based on the EVIDENCE and WEBPAGE TEXT.
-            3. IDENTITY RULE: If the question asks for "your secret", "password", or "email", you MUST output your actual credentials (from above), NOT the placeholder text.
-            4. DATA RULE: If the question requires calculation, perform it using the data in the EVIDENCE block.
+            RULES FOR ANSWERING:
+            - IDENTITY: If asked for "your secret", "password", or "email", output the USER IDENTITY values.
+            - EXTRACTION: If asked to "scrape" or "find" a code on the page, look closely at the PAGE TEXT. It might be a random string like "H5K9". Extract it exactly.
+            - CALCULATION: If asked for a sum, use the EVIDENCE data.
             
             Return JSON ONLY:
             {{
                 "submission_url": "...",
-                "payload": {{ ...correct json payload... }}
+                "payload": {{
+                    "email": "{email}",
+                    "secret": "{student_secret}",
+                    "url": "{task_url}",
+                    "answer": <THE_EXACT_ANSWER_VALUE>
+                }}
             }}
             """
 
@@ -167,14 +167,19 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             submission_url = ai_data.get("submission_url")
             payload = ai_data.get("payload")
             
-            # Handle relative URLs
-            if submission_url and not submission_url.startswith("http"):
-                submission_url = urljoin(task_url, submission_url)
+            # --- ROBUST URL FIXING ---
+            if submission_url:
+                if not submission_url.startswith("http"):
+                    submission_url = urljoin(task_url, submission_url)
+            
+            # Ensure the payload URL is also valid
+            if "url" in payload and not payload["url"].startswith("http"):
+                 payload["url"] = task_url
 
             print(f"    AI Answer: {payload.get('answer')}")
             print(f"    Submitting to: {submission_url}")
 
-            # 5. SUBMIT & RECURSE
+            # 5. SUBMIT
             if submission_url:
                 submit_res = requests.post(submission_url, json=payload)
                 try:
