@@ -22,7 +22,7 @@ load_dotenv()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 MY_SECRET = os.getenv("MY_SECRET")
 
-# Chat Proxy (Audio proxy bypassed via Google Speech)
+# Proxy for Chat (still needed), but we bypass it for Audio
 client = OpenAI(api_key=AIPIPE_TOKEN, base_url="https://aipipe.org/openai/v1")
 app = FastAPI()
 
@@ -36,66 +36,60 @@ class QuizRequest(BaseModel):
 # ==========================================
 
 async def process_audio_google(url: str) -> str:
-    """Bypasses AI Pipe proxy using Google Speech Recognition."""
+    """
+    Downloads audio, converts to WAV, and uses Google Speech Recognition.
+    """
     print(f"    [Tool] 🔊 Found Audio: {url}")
     try:
-        resp = requests.get(url, timeout=30)
-        if 'text/html' in resp.headers.get('Content-Type', ''): return ""
+        # 1. Download with increased timeout
+        resp = requests.get(url, timeout=45)
+        if 'text/html' in resp.headers.get('Content-Type', ''): 
+            print("    [Tool] Skipping: URL returned HTML.")
+            return ""
         
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Save and Convert
-            orig_path = os.path.join(temp_dir, "original")
-            with open(orig_path, "wb") as f: f.write(resp.content)
+            # Save original
+            orig_path = os.path.join(temp_dir, "original_audio")
+            with open(orig_path, "wb") as f:
+                f.write(resp.content)
             
+            # Convert to WAV (Google requirement)
             wav_path = os.path.join(temp_dir, "converted.wav")
-            AudioSegment.from_file(orig_path).export(wav_path, format="wav")
+            
+            # Use pydub to convert (requires ffmpeg installed in Docker)
+            audio = AudioSegment.from_file(orig_path)
+            audio.export(wav_path, format="wav")
             
             # Transcribe
-            r = sr.Recognizer()
+            recognizer = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
-                audio = r.record(source)
-                text = r.recognize_google(audio)
-            
-            print(f"    [Tool] Transcript: {text[:50]}...")
-            return f"\n[AUDIO TRANSCRIPT]: \"{text}\"\n"
+                audio_data = recognizer.record(source)
+                # Google Web Speech API (High quality, free)
+                text = recognizer.recognize_google(audio_data)
+                
+            print(f"    [Tool] Transcription: {text[:50]}...")
+            return f"\n[AUDIO TRANSCRIPT SOURCE: {url}]\n{text}\n"
+
     except Exception as e:
         print(f"    [Tool] Audio Error: {e}")
-        return ""
+        return f"\n[AUDIO ERROR]: Could not transcribe {url} ({str(e)})\n"
 
 async def process_csv_url(url: str) -> str:
     print(f"    [Tool] 📊 Found CSV: {url}")
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=30)
         if 'text/html' in r.headers.get('Content-Type', ''): return ""
         content = r.content.decode("utf-8", errors="replace")
-        return content
-    except:
+        return f"\n[CSV CONTENT SOURCE: {url}]\n{content}\n"
+    except Exception as e:
         return ""
 
-def get_csv_stats(text: str) -> str:
-    """Pre-calculates math so the AI doesn't have to guess."""
-    if not text: return ""
-    # Extract all numbers
-    nums = [float(x) for x in re.findall(r'-?\d+\.?\d*', text.replace(',', ''))]
-    if not nums: return ""
-    
-    total = sum(nums)
-    count = len(nums)
-    maximum = max(nums)
-    
-    # Format integers nicely
-    if total.is_integer(): total = int(total)
-    if maximum.is_integer(): maximum = int(maximum)
-    
-    return f"""
-    [SYSTEM MATH HINTS]:
-    - Count of numbers found: {count}
-    - Sum of numbers: {total}
-    - Max value: {maximum}
-    """
+def extract_numbers(text: str):
+    """Helper to extract numbers for local math verification"""
+    return [float(x) for x in re.findall(r'-?\d+\.?\d*', text.replace(',', ''))]
 
 def extract_secret_regex(text: str) -> str:
-    """Finds codes like 'The secret is XYZ'."""
+    """Finds 'secret is XYZ' in text."""
     patterns = [
         r"secret\s+(?:code\s+)?(?:is|:)\s*([A-Za-z0-9]+)",
         r"code\s+(?:is|:)\s*([A-Za-z0-9]+)",
@@ -122,59 +116,81 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             await page.wait_for_selector("body", timeout=15000)
             page_text = await page.evaluate("document.body.innerText")
 
-            # 1. FIND LINKS
-            links = await page.evaluate("""() => {
-                let arr = [];
-                document.querySelectorAll('a').forEach(a => arr.push(a.href));
-                document.querySelectorAll('audio, source').forEach(el => arr.push(el.src));
-                return arr;
+            # 1. EXTRACT LINKS (Raw DOM extraction)
+            media_links = await page.evaluate("""() => {
+                let links = [];
+                document.querySelectorAll('a').forEach(a => { if (a.href) links.push(a.href) });
+                document.querySelectorAll('audio, source').forEach(el => { if (el.src) links.push(el.src) });
+                return links;
             }""")
 
-            # 2. PROCESS FILES
             evidence = ""
-            csv_content = ""
+            csv_nums = []
+            
+            # 2. INTELLIGENT DOWNLOADER
+            # Strictly checks extensions to avoid mixing up CSVs and Audio
             seen = set()
+            for url in media_links:
+                if url in seen or url.rstrip('/') == task_url.rstrip('/'): continue
+                seen.add(url)
+                
+                u_low = url.lower()
+                
+                # Check CSV first
+                if u_low.endswith('.csv') or ('csv' in u_low and 'download' in u_low and not 'audio' in u_low):
+                    csv_text = await process_csv_url(url)
+                    if csv_text:
+                        evidence += csv_text
+                        csv_nums = extract_numbers(csv_text)
+                
+                # Check Audio second
+                elif u_low.endswith(('.mp3', '.wav', '.opus', '.m4a', '.oga')) or 'audio' in u_low:
+                    # Logic: Only treat as audio if it DOESN'T look like a CSV url
+                    if not u_low.endswith('.csv'):
+                        evidence += await process_audio_google(url)
+
+            # 3. REASONING
+            extracted_code = extract_secret_regex(page_text)
             
-            for link in links:
-                if link in seen or link.rstrip('/') == task_url.rstrip('/'): continue
-                seen.add(link)
-                
-                # Audio
-                if any(x in link.lower() for x in ['.mp3', '.wav', '.opus', 'audio']):
-                    evidence += await process_audio_google(link)
-                
-                # CSV
-                elif 'csv' in link.lower() or 'download' in link.lower():
-                    csv_data = await process_csv_url(link)
-                    if csv_data:
-                        csv_content = csv_data
-                        evidence += f"\n[CSV FILE CONTENT (Truncated)]:\n{csv_data[:500]}\n"
-
-            # 3. PREPARE INTELLIGENCE
-            regex_secret = extract_secret_regex(page_text)
-            math_hints = get_csv_stats(csv_content)
-
-            # 4. AI PROMPT
+            # Pre-calculate Math
+            math_answer = None
+            if csv_nums:
+                math_answer = sum(csv_nums)
+                if math_answer.is_integer(): math_answer = int(math_answer)
+            
             prompt = f"""
-            You are a Quiz Solving Robot.
+            You are an autonomous Quiz Solving Agent.
             
-            === INTERNAL DATA ===
-            EMAIL: "{email}"
-            SECRET: "{student_secret}"
+            === INTERNAL IDENTITY ===
+            - EMAIL: "{email}"
+            - SECRET: "{student_secret}"
+            (Use these ONLY if the page specifically asks for "YOUR" credentials)
             
-            === PAGE DATA ===
-            TEXT: {page_text}
-            FILES FOUND: {evidence}
-            MATH ANALYSIS: {math_hints}
-            REGEX MATCH: {regex_secret if regex_secret else "None"}
+            === COLLECTED EVIDENCE ===
+            {evidence}
             
-            === INSTRUCTIONS ===
-            1. SCRAPING: If the page text says "The secret is XYZ", output "XYZ". Do NOT output placeholders like "<CODE>". If Regex Match found something, prefer that.
-            2. MATH: If Audio says "Sum the numbers", use the "Sum" from MATH ANALYSIS.
-            3. IDENTITY: If asked for "your secret", use INTERNAL DATA SECRET.
+            === PAGE TEXT ===
+            {page_text}
             
-            Return JSON:
-            {{ "submission_url": "...", "payload": {{ "email": "{email}", "secret": "{student_secret}", "url": "{task_url}", "answer": <REAL VALUE> }} }}
+            === CLUES DETECTED ===
+            - Regex Secret Found: {extracted_code if extracted_code else "None"}
+            - CSV Sum Calculated: {math_answer if math_answer else "None"}
+            
+            === RULES ===
+            1. IDENTITY: If page asks for "your secret", "password", or "email", use INTERNAL IDENTITY.
+            2. CODE: If page says "The secret code is...", use that code.
+            3. MATH: If page asks to sum numbers, prefer the 'CSV Sum Calculated'.
+            
+            Return JSON ONLY:
+            {{
+                "submission_url": "...",
+                "payload": {{
+                    "email": "{email}",
+                    "secret": "{student_secret}",
+                    "url": "{task_url}",
+                    "answer": <THE_FINAL_ANSWER>
+                }}
+            }}
             """
 
             response = client.chat.completions.create(
@@ -183,34 +199,39 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                 response_format={"type": "json_object"}
             )
             
-            data = json.loads(response.choices[0].message.content)
-            submission_url = data.get("submission_url")
-            payload = data.get("payload")
+            ai_data = json.loads(response.choices[0].message.content)
+            submission_url = ai_data.get("submission_url")
+            payload = ai_data.get("payload")
 
-            # --- POST-PROCESSING & SAFETY NETS ---
-            
-            # URL Fix
+            # Final Cleanup
             if submission_url and not submission_url.startswith("http"):
                 submission_url = urljoin(task_url, submission_url)
             
-            # Answer Cleanup (Fixes Level 2 Hallucination)
-            ans = str(payload.get("answer", ""))
-            if "<" in ans and ">" in ans: # Detects placeholders like <CODE>
-                if regex_secret:
-                    print("    ⚠️ Detected placeholder. Swapping with Regex match.")
-                    payload["answer"] = regex_secret
-            
-            # Identity Swap (Fixes Level 2 Secret Mismatch)
-            if "your secret" in ans.lower():
-                 payload["answer"] = student_secret
+            # Local Logic Overrides
+            # 1. Force Regex Secret if available
+            if extracted_code and "your secret" in str(payload.get("answer", "")).lower():
+                print("    ⚠️ Overriding with Regex Secret.")
+                payload["answer"] = extracted_code
 
-            print(f"    Final Answer: {payload.get('answer')}")
+            # 2. Force Math Sum if available and answer looks wrong
+            if math_answer is not None and (payload.get("answer") == 0 or payload.get("answer") == "0"):
+                 print("    ⚠️ Overriding with CSV Sum.")
+                 payload["answer"] = math_answer
+
+            # 3. Force Internal Secret if needed
+            if "your secret" in str(payload.get("answer", "")).lower():
+                if "secret" in page_text.lower() and "input" in page_text.lower():
+                    print("    ⚠️ Overriding with Internal Secret.")
+                    payload["answer"] = student_secret
+
+            print(f"    AI Answer: {payload.get('answer')}")
             print(f"    Submitting to: {submission_url}")
 
             if submission_url:
                 res = requests.post(submission_url, json=payload).json()
                 print("    Server:", res)
                 
+                # RECURSION
                 if res.get("url"):
                     await browser.close()
                     await solve_quiz_task(res["url"], email, student_secret)
@@ -223,7 +244,5 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
 
 @app.post("/run")
 async def run_task(request: QuizRequest, background_tasks: BackgroundTasks):
-    if request.secret != MY_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
     background_tasks.add_task(solve_quiz_task, request.url, request.email, request.secret)
     return {"message": "Task started", "status": "processing"}

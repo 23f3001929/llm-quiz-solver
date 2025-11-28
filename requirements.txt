@@ -1,9 +1,7 @@
 fastapi
 uvicorn
 requests
-playwright==1.48.0
+playwright
 openai
 python-dotenv
 pydantic
-SpeechRecognition
-pydub
