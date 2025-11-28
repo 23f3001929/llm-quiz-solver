@@ -4,8 +4,7 @@ import re
 import asyncio
 import requests
 import tempfile
-import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -22,7 +21,7 @@ load_dotenv()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 MY_SECRET = os.getenv("MY_SECRET")
 
-# Proxy for Chat (still needed), but we bypass it for Audio
+# Use proxy for Chat, but we bypass it for Audio using Google
 client = OpenAI(api_key=AIPIPE_TOKEN, base_url="https://aipipe.org/openai/v1")
 app = FastAPI()
 
@@ -37,59 +36,65 @@ class QuizRequest(BaseModel):
 
 async def process_audio_google(url: str) -> str:
     """
-    Downloads audio, converts to WAV, and uses Google Speech Recognition.
+    Downloads audio, converts to WAV, and transcribes.
+    Bypasses the broken AI Pipe proxy by using Google Speech Rec.
     """
-    print(f"    [Tool] 🔊 Found Audio: {url}")
+    print(f"    [Tool] 🔊 Processing Audio: {url}")
     try:
-        # 1. Download with increased timeout
-        resp = requests.get(url, timeout=45)
-        if 'text/html' in resp.headers.get('Content-Type', ''): 
-            print("    [Tool] Skipping: URL returned HTML.")
+        # Check headers first to ensure it's actually audio
+        head = requests.head(url, timeout=5)
+        if 'text/html' in head.headers.get('Content-Type', ''):
+            print("    [Skip] URL is a webpage, not audio.")
             return ""
+
+        resp = requests.get(url, timeout=30)
         
         with tempfile.TemporaryDirectory() as temp_dir:
             # Save original
             orig_path = os.path.join(temp_dir, "original_audio")
-            with open(orig_path, "wb") as f:
-                f.write(resp.content)
+            with open(orig_path, "wb") as f: f.write(resp.content)
             
-            # Convert to WAV (Google requirement)
+            # Convert to WAV (Requires ffmpeg in Dockerfile)
             wav_path = os.path.join(temp_dir, "converted.wav")
-            
-            # Use pydub to convert (requires ffmpeg installed in Docker)
-            audio = AudioSegment.from_file(orig_path)
-            audio.export(wav_path, format="wav")
+            try:
+                AudioSegment.from_file(orig_path).export(wav_path, format="wav")
+            except Exception:
+                return "\n[ERROR] Audio conversion failed. Is ffmpeg installed?\n"
             
             # Transcribe
-            recognizer = sr.Recognizer()
+            r = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
-                audio_data = recognizer.record(source)
-                # Google Web Speech API (High quality, free)
-                text = recognizer.recognize_google(audio_data)
-                
-            print(f"    [Tool] Transcription: {text[:50]}...")
-            return f"\n[AUDIO TRANSCRIPT SOURCE: {url}]\n{text}\n"
+                audio = r.record(source)
+                text = r.recognize_google(audio)
+            
+            print(f"    [Tool] Transcript: {text[:50]}...")
+            return f"\n[AUDIO TRANSCRIPT SOURCE: {url}]\nContent: \"{text}\"\n(Use this instruction to process the CSV data)\n"
 
     except Exception as e:
         print(f"    [Tool] Audio Error: {e}")
-        return f"\n[AUDIO ERROR]: Could not transcribe {url} ({str(e)})\n"
+        return ""
 
 async def process_csv_url(url: str) -> str:
-    print(f"    [Tool] 📊 Found CSV: {url}")
+    print(f"    [Tool] 📊 Processing CSV: {url}")
     try:
-        r = requests.get(url, timeout=30)
-        if 'text/html' in r.headers.get('Content-Type', ''): return ""
+        # Check headers
+        head = requests.head(url, timeout=5)
+        if 'text/html' in head.headers.get('Content-Type', ''): return ""
+
+        r = requests.get(url, timeout=15)
         content = r.content.decode("utf-8", errors="replace")
-        return f"\n[CSV CONTENT SOURCE: {url}]\n{content}\n"
+        
+        # Limit content size to prevent token overflow (first 500 lines or 15k chars)
+        lines = content.splitlines()
+        if len(lines) > 500:
+            content = "\n".join(lines[:500]) + "\n...[Truncated]..."
+            
+        return f"\n[CSV FILE CONTENT SOURCE: {url}]\n{content}\n"
     except Exception as e:
         return ""
 
-def extract_numbers(text: str):
-    """Helper to extract numbers for local math verification"""
-    return [float(x) for x in re.findall(r'-?\d+\.?\d*', text.replace(',', ''))]
-
 def extract_secret_regex(text: str) -> str:
-    """Finds 'secret is XYZ' in text."""
+    """Backup method to find secrets if AI misses them."""
     patterns = [
         r"secret\s+(?:code\s+)?(?:is|:)\s*([A-Za-z0-9]+)",
         r"code\s+(?:is|:)\s*([A-Za-z0-9]+)",
@@ -116,7 +121,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             await page.wait_for_selector("body", timeout=15000)
             page_text = await page.evaluate("document.body.innerText")
 
-            # 1. EXTRACT LINKS (Raw DOM extraction)
+            # 1. EXTRACT ALL RELEVANT LINKS
             media_links = await page.evaluate("""() => {
                 let links = [];
                 document.querySelectorAll('a').forEach(a => { if (a.href) links.push(a.href) });
@@ -125,70 +130,60 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             }""")
 
             evidence = ""
-            csv_nums = []
-            
-            # 2. INTELLIGENT DOWNLOADER
-            # Strictly checks extensions to avoid mixing up CSVs and Audio
             seen = set()
+            
+            # 2. SMART DOWNLOAD LOOP
             for url in media_links:
                 if url in seen or url.rstrip('/') == task_url.rstrip('/'): continue
                 seen.add(url)
                 
                 u_low = url.lower()
                 
-                # Check CSV first
-                if u_low.endswith('.csv') or ('csv' in u_low and 'download' in u_low and not 'audio' in u_low):
-                    csv_text = await process_csv_url(url)
-                    if csv_text:
-                        evidence += csv_text
-                        csv_nums = extract_numbers(csv_text)
+                # STRICT TYPE CHECKING to prevent "Audio Error" on CSV files
+                is_audio_ext = u_low.endswith(('.mp3', '.wav', '.opus', '.m4a', '.oga'))
+                is_csv_ext = u_low.endswith('.csv')
                 
-                # Check Audio second
-                elif u_low.endswith(('.mp3', '.wav', '.opus', '.m4a', '.oga')) or 'audio' in u_low:
-                    # Logic: Only treat as audio if it DOESN'T look like a CSV url
-                    if not u_low.endswith('.csv'):
-                        evidence += await process_audio_google(url)
+                if is_csv_ext:
+                    evidence += await process_csv_url(url)
+                elif is_audio_ext:
+                    evidence += await process_audio_google(url)
+                elif 'download' in u_low and not is_audio_ext:
+                    # Fallback for generic download links - try CSV first
+                    evidence += await process_csv_url(url)
 
-            # 3. REASONING
-            extracted_code = extract_secret_regex(page_text)
-            
-            # Pre-calculate Math
-            math_answer = None
-            if csv_nums:
-                math_answer = sum(csv_nums)
-                if math_answer.is_integer(): math_answer = int(math_answer)
+            # 3. REASONING AGENT
+            # We explicitly tell the AI to prioritize Audio Instructions over simple math.
+            regex_match = extract_secret_regex(page_text)
             
             prompt = f"""
-            You are an autonomous Quiz Solving Agent.
+            You are an expert Data Processing Agent.
             
-            === INTERNAL IDENTITY ===
-            - EMAIL: "{email}"
-            - SECRET: "{student_secret}"
-            (Use these ONLY if the page specifically asks for "YOUR" credentials)
+            === CREDENTIALS ===
+            EMAIL: "{email}"
+            SECRET: "{student_secret}"
             
-            === COLLECTED EVIDENCE ===
+            === EVIDENCE COLLECTED ===
             {evidence}
             
             === PAGE TEXT ===
             {page_text}
             
-            === CLUES DETECTED ===
-            - Regex Secret Found: {extracted_code if extracted_code else "None"}
-            - CSV Sum Calculated: {math_answer if math_answer else "None"}
+            === INSTRUCTIONS ===
+            1. CHECK AUDIO: Read the [AUDIO TRANSCRIPT] carefully. It often contains a FILTER condition (e.g., "only sum numbers > 50000").
+            2. CHECK CSV: Apply the filter from the audio to the [CSV FILE CONTENT] and perform the calculation.
+            3. CHECK SECRET: If the page asks for "your secret", use the CREDENTIALS. If it asks for a "scraped code", use the text found on the page.
             
-            === RULES ===
-            1. IDENTITY: If page asks for "your secret", "password", or "email", use INTERNAL IDENTITY.
-            2. CODE: If page says "The secret code is...", use that code.
-            3. MATH: If page asks to sum numbers, prefer the 'CSV Sum Calculated'.
+            === REGEX HINT ===
+            (Use this if you can't find a code in the text): {regex_match if regex_match else "None"}
             
-            Return JSON ONLY:
+            Return VALID JSON ONLY:
             {{
                 "submission_url": "...",
                 "payload": {{
                     "email": "{email}",
                     "secret": "{student_secret}",
                     "url": "{task_url}",
-                    "answer": <THE_FINAL_ANSWER>
+                    "answer": <CALCULATED_VALUE_OR_STRING>
                 }}
             }}
             """
@@ -199,39 +194,35 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                 response_format={"type": "json_object"}
             )
             
-            ai_data = json.loads(response.choices[0].message.content)
-            submission_url = ai_data.get("submission_url")
-            payload = ai_data.get("payload")
+            data = json.loads(response.choices[0].message.content)
+            submission_url = data.get("submission_url")
+            payload = data.get("payload")
 
-            # Final Cleanup
+            # --- SAFETY NETS ---
             if submission_url and not submission_url.startswith("http"):
                 submission_url = urljoin(task_url, submission_url)
             
-            # Local Logic Overrides
-            # 1. Force Regex Secret if available
-            if extracted_code and "your secret" in str(payload.get("answer", "")).lower():
-                print("    ⚠️ Overriding with Regex Secret.")
-                payload["answer"] = extracted_code
-
-            # 2. Force Math Sum if available and answer looks wrong
-            if math_answer is not None and (payload.get("answer") == 0 or payload.get("answer") == "0"):
-                 print("    ⚠️ Overriding with CSV Sum.")
-                 payload["answer"] = math_answer
-
-            # 3. Force Internal Secret if needed
-            if "your secret" in str(payload.get("answer", "")).lower():
-                if "secret" in page_text.lower() and "input" in page_text.lower():
-                    print("    ⚠️ Overriding with Internal Secret.")
+            # Prevent "placeholder" answers
+            ans_str = str(payload.get("answer", "")).lower()
+            if "scraped" in ans_str or "code" in ans_str or "<" in ans_str:
+                if regex_match:
+                    print("    ⚠️ Replaced placeholder with Regex Match.")
+                    payload["answer"] = regex_match
+                elif "secret" in page_text.lower():
                     payload["answer"] = student_secret
+
+            # Fix common "Your Secret" mistake
+            if "your secret" in ans_str:
+                 payload["answer"] = student_secret
 
             print(f"    AI Answer: {payload.get('answer')}")
             print(f"    Submitting to: {submission_url}")
 
+            # 4. SUBMIT & RECURSE
             if submission_url:
                 res = requests.post(submission_url, json=payload).json()
                 print("    Server:", res)
                 
-                # RECURSION
                 if res.get("url"):
                     await browser.close()
                     await solve_quiz_task(res["url"], email, student_secret)
@@ -244,5 +235,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
 
 @app.post("/run")
 async def run_task(request: QuizRequest, background_tasks: BackgroundTasks):
+    if request.secret != MY_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
     background_tasks.add_task(solve_quiz_task, request.url, request.email, request.secret)
     return {"message": "Task started", "status": "processing"}
