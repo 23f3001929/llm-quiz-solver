@@ -4,7 +4,7 @@ import asyncio
 import requests
 import tempfile
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -42,19 +42,19 @@ async def process_audio_url(url: str) -> str:
         
         audio_bytes = response.content
         
-        # 3. MANUAL WHISPER REQUEST (The "Multipart" Fix)
-        # We send 'model' as part of the 'files' dict to force correct headers for the proxy
+        # --- THE FIX FOR AI PIPE AUDIO ERROR ---
+        # We send the 'model' inside the 'files' dictionary as a tuple (None, value).
+        # This forces it into the multipart payload in a way proxies can always read.
         transcription_url = "https://aipipe.org/openai/v1/audio/transcriptions"
         headers = { "Authorization": f"Bearer {AIPIPE_TOKEN}" }
         
-        # TRICK: Send non-file fields as (None, value) tuples in 'files'
-        multipart_payload = {
+        multipart_data = {
             'file': ('audio.mp3', audio_bytes, 'audio/mpeg'),
-            'model': (None, 'whisper-1') 
+            'model': (None, 'whisper-1')  # <--- CRITICAL FIX
         }
         
-        print("    [Tool] Sending to Whisper API...")
-        api_res = requests.post(transcription_url, headers=headers, files=multipart_payload)
+        print("    [Tool] Sending to Whisper API (Multipart Mode)...")
+        api_res = requests.post(transcription_url, headers=headers, files=multipart_data)
         
         if api_res.status_code == 200:
             transcript_text = api_res.json().get('text', '')
@@ -133,13 +133,13 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
 
             # 4. THE BRAIN (Revised Prompt)
             prompt = f"""
-            You are a smart autonomous agent.
+            You are a Data Scraper.
             
-            CREDENTIALS:
+            USER IDENTITY:
             - EMAIL: "{email}"
             - SECRET: "{student_secret}"
             
-            EVIDENCE:
+            EVIDENCE (Files/Audio):
             {evidence_log}
             
             PAGE TEXT:
@@ -151,10 +151,10 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             1. Find the Submission URL.
             2. Answer the question.
             
-            LOGIC RULES:
-            - SCRAPING: If the page text says "The secret is XYZ" or "Hidden code: ABC", use "XYZ" or "ABC" as the answer. DO NOT use your own credentials.
-            - AUTHENTICATION: Only use the CREDENTIALS (SECRET) if the page explicitly asks for "YOUR password" or "YOUR authentication key" and there is no other code on the page.
-            - CALCULATION: Use EVIDENCE to solve math questions.
+            RULES:
+            - IDENTITY: If asked for "your secret" or "email", use the USER IDENTITY.
+            - SCRAPING: If the text says "The secret code is XYZ", use "XYZ". Do NOT repeat the instruction like "the code you scraped". actually FIND the code in the text.
+            - MATH: If asked to sum numbers, use the EVIDENCE data.
             
             Return JSON ONLY:
             {{
@@ -163,7 +163,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                     "email": "{email}",
                     "secret": "{student_secret}",
                     "url": "{task_url}",
-                    "answer": <THE_EXACT_ANSWER>
+                    "answer": <THE_EXACT_ANSWER_VALUE>
                 }}
             }}
             """
