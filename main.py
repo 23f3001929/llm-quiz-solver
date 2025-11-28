@@ -42,19 +42,21 @@ async def process_audio_url(url: str) -> str:
         
         audio_bytes = response.content
         
-        # --- THE FIX FOR AI PIPE AUDIO ERROR ---
-        # We send the 'model' inside the 'files' dictionary as a tuple (None, value).
-        # This forces it into the multipart payload in a way proxies can always read.
-        transcription_url = "https://aipipe.org/openai/v1/audio/transcriptions"
+        # --- FIX FOR AI PIPE PROXY ERROR ---
+        # We send 'model' in the URL params AND the body to ensure the proxy sees it for cost calc.
+        transcription_url = "https://aipipe.org/openai/v1/audio/transcriptions?model=whisper-1"
         headers = { "Authorization": f"Bearer {AIPIPE_TOKEN}" }
         
-        multipart_data = {
-            'file': ('audio.mp3', audio_bytes, 'audio/mpeg'),
-            'model': (None, 'whisper-1')  # <--- CRITICAL FIX
+        # Standard Multipart Form Data
+        files = {
+            'file': ('audio.mp3', audio_bytes, 'audio/mpeg')
+        }
+        data = {
+            'model': 'whisper-1' 
         }
         
-        print("    [Tool] Sending to Whisper API (Multipart Mode)...")
-        api_res = requests.post(transcription_url, headers=headers, files=multipart_data)
+        print("    [Tool] Sending to Whisper API (Query Param Mode)...")
+        api_res = requests.post(transcription_url, headers=headers, files=files, data=data)
         
         if api_res.status_code == 200:
             transcript_text = api_res.json().get('text', '')
@@ -101,7 +103,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             # 2. EXTRACT CONTENT
             page_text = await page.evaluate("document.body.innerText")
             
-            # 3. CHECK FOR FILES (Code-based detection)
+            # 3. CHECK FOR FILES
             media_links = await page.evaluate("""() => {
                 let links = [];
                 document.querySelectorAll('a').forEach(a => {
@@ -131,11 +133,11 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                         evidence_log += await process_csv_url(url)
                         processed_urls.add(url)
 
-            # 4. THE BRAIN (Revised Prompt)
+            # 4. THE BRAIN
             prompt = f"""
-            You are a Data Scraper.
+            You are a Quiz Solver Agent.
             
-            USER IDENTITY:
+            INTERNAL DATA:
             - EMAIL: "{email}"
             - SECRET: "{student_secret}"
             
@@ -152,9 +154,9 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             2. Answer the question.
             
             RULES:
-            - IDENTITY: If asked for "your secret" or "email", use the USER IDENTITY.
-            - SCRAPING: If the text says "The secret code is XYZ", use "XYZ". Do NOT repeat the instruction like "the code you scraped". actually FIND the code in the text.
-            - MATH: If asked to sum numbers, use the EVIDENCE data.
+            - IF asking for "your secret/email": Use INTERNAL DATA.
+            - IF asking for "scraped code": Find the code in PAGE TEXT or EVIDENCE.
+            - IF calculation needed: Use EVIDENCE.
             
             Return JSON ONLY:
             {{
@@ -178,7 +180,17 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             submission_url = ai_data.get("submission_url")
             payload = ai_data.get("payload")
             
-            # --- URL FIXING ---
+            # --- SAFETY NET: FORCE CREDENTIAL SWAP ---
+            # If the AI accidentally returns the placeholder text, we fix it here.
+            raw_answer = str(payload.get("answer", "")).lower()
+            if "your secret" in raw_answer or "my secret" in raw_answer:
+                print("    ⚠️ Safety Net: Swapping placeholder for actual secret.")
+                payload["answer"] = student_secret
+            if "your email" in raw_answer:
+                payload["answer"] = email
+            # -----------------------------------------
+
+            # URL Fixing
             if submission_url:
                 if not submission_url.startswith("http"):
                     submission_url = urljoin(task_url, submission_url)
