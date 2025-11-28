@@ -45,7 +45,11 @@ async def process_audio_google(url: str) -> str:
             with open(orig_path, "wb") as f: f.write(resp.content)
             
             wav_path = os.path.join(temp_dir, "converted.wav")
-            AudioSegment.from_file(orig_path).export(wav_path, format="wav")
+            # Audio conversion (requires ffmpeg)
+            try:
+                AudioSegment.from_file(orig_path).export(wav_path, format="wav")
+            except:
+                return "\n[ERROR] Audio conversion failed. FFmpeg missing?\n"
             
             r = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
@@ -64,7 +68,6 @@ async def process_csv_url(url: str) -> list:
     try:
         r = requests.get(url, timeout=15)
         content = r.content.decode("utf-8", errors="replace")
-        # Extract all numbers using regex
         nums = [float(x) for x in re.findall(r'-?\d+\.?\d*', content.replace(',', ''))]
         return nums
     except:
@@ -72,7 +75,7 @@ async def process_csv_url(url: str) -> list:
 
 def execute_math_logic(numbers: list, operation: str, threshold: float = None):
     """
-    Executes the logic decided by the AI.
+    Executes the logic decided by the AI on the CSV numbers.
     """
     if not numbers: return 0
     
@@ -83,6 +86,8 @@ def execute_math_logic(numbers: list, operation: str, threshold: float = None):
         elif "less" in operation or "<" in operation:
             filtered_nums = [n for n in numbers if n < threshold]
     
+    if not filtered_nums: return 0 # Avoid crash on empty list
+
     if "sum" in operation:
         val = sum(filtered_nums)
     elif "count" in operation:
@@ -92,9 +97,9 @@ def execute_math_logic(numbers: list, operation: str, threshold: float = None):
     elif "min" in operation:
         val = min(filtered_nums)
     elif "average" in operation:
-        val = sum(filtered_nums) / len(filtered_nums) if filtered_nums else 0
+        val = sum(filtered_nums) / len(filtered_nums)
     else:
-        val = sum(numbers) # Default to sum
+        val = sum(numbers) 
         
     return int(val) if val.is_integer() else val
 
@@ -113,10 +118,10 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
             
-            # Smart Scraping: Get visible text AND specific tag values
+            # Scrape visible text AND hidden code blocks
             page_text = await page.evaluate("""() => {
                 return document.body.innerText + "\\n" + 
-                       Array.from(document.querySelectorAll('code, pre, .secret, .code')).map(e => e.innerText).join("\\n");
+                       Array.from(document.querySelectorAll('code, pre, .secret')).map(e => e.innerText).join("\\n");
             }""")
 
             # 1. EXTRACT LINKS
@@ -145,9 +150,9 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                     csv_numbers = await process_csv_url(url)
                     evidence_text += f"\n[CSV FILE FOUND]: Contains {len(csv_numbers)} numbers.\n"
 
-            # 3. ASK AI FOR THE PLAN (Not the answer)
+            # 3. ASK AI FOR THE PLAN
             prompt = f"""
-            You are a Logic Extraction Engine.
+            You are a Logic Engine.
             
             === PAGE TEXT ===
             {page_text}
@@ -156,18 +161,19 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             {evidence_text}
             
             === MISSION ===
-            Analyze the instructions. Return a JSON object describing HOW to solve the problem.
+            Return a JSON object describing HOW to solve the problem.
             
-            1. SCRAPING: Is there a secret code mentioned on the page (e.g. "Cutoff is 5000", "Secret: XYZ")? Extract it.
-            2. MATH LOGIC: What calculation should be performed on the CSV numbers? (e.g. "sum numbers greater than 5000").
+            1. SCRAPING: Is there a secret code mentioned on the page (e.g. "Cutoff is 5000", "Secret: XYZ")? 
+               IGNORE placeholders like "your secret", "email", "code". Look for REAL values.
+            2. MATH LOGIC: What calculation should be performed on the CSV numbers?
             
-            Return JSON ONLY format:
+            Return JSON ONLY:
             {{
-                "submission_url": "URL found on page or /submit",
-                "secret_code_found": "The code found in text (or null)",
+                "submission_url": "URL found on page",
+                "secret_code_found": "The actual code/value found (or null if it's just instruction text)",
                 "math_operation": "sum/count/average/max",
                 "math_filter": "greater_than/less_than/none",
-                "math_threshold": 12345 (number found in text/audio, or null if none)
+                "math_threshold": 12345 (number found in text/audio, or null)
             }}
             """
 
@@ -183,40 +189,46 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             # 4. EXECUTE THE PLAN (Python Logic)
             final_answer = None
             
-            # Priority A: Scraped Secret (Level 2 Fix)
-            if plan.get("secret_code_found"):
-                final_answer = plan["secret_code_found"]
-            
-            # Priority B: Math Calculation (Level 3 Fix)
-            elif csv_numbers:
+            # Step A: Validate the scraped code
+            # If the AI scraped "your secret" or "code", it's garbage. Ignore it.
+            scraped = plan.get("secret_code_found")
+            if scraped and str(scraped).lower() in ["your secret", "secret", "code", "email", "password"]:
+                print(f"    [Logic] Ignored placeholder code: {scraped}")
+                scraped = None
+
+            # Step B: Priority Logic
+            # 1. If we have CSV numbers and a Math Operation, DO MATH.
+            if csv_numbers and plan.get("math_operation") and plan.get("math_operation") != "none":
                 op = plan.get("math_operation", "sum")
                 filt = plan.get("math_filter", "none")
                 thresh = plan.get("math_threshold")
                 
-                # Convert threshold to number if needed
+                # Clean threshold
                 if thresh is not None:
                     try: thresh = float(str(thresh).replace(',',''))
                     except: thresh = None
                 
-                # Combine op and filter for the helper
                 op_key = f"{op}_{filt}"
                 final_answer = execute_math_logic(csv_numbers, op_key, thresh)
-                print(f"    [Math] Executed {op} on {len(csv_numbers)} nums with threshold {thresh} -> {final_answer}")
-
-            # Priority C: Fallback to Student Secret
-            if not final_answer:
-                # If page explicitly asks for "your secret", use it.
-                if "secret" in page_text.lower() and "input" in page_text.lower():
-                    final_answer = student_secret
-                else:
-                    final_answer = student_secret # Default fallback
+                print(f"    [Math] Executed {op} with threshold {thresh} -> {final_answer}")
+            
+            # 2. If no math, use the scraped code (if valid)
+            elif scraped:
+                final_answer = scraped
+                
+            # 3. Fallback: Use Student Secret
+            else:
+                final_answer = student_secret
 
             # 5. SUBMIT
             submission_url = plan.get("submission_url")
             if submission_url and not submission_url.startswith("http"):
                 submission_url = urljoin(task_url, submission_url)
             
-            # Payload construction
+            # Ultimate Safety Net: If final answer is literally "your secret", swap it.
+            if str(final_answer).lower() == "your secret":
+                final_answer = student_secret
+
             payload = {
                 "email": email,
                 "secret": student_secret,
