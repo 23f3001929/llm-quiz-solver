@@ -4,8 +4,6 @@ import asyncio
 import requests
 import tempfile
 import time
-import csv
-import io
 from urllib.parse import urljoin
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -33,20 +31,34 @@ class QuizRequest(BaseModel):
     url: str
 
 # ==========================================
-# 2. MEDIA HANDLING TOOLS
+# 2. TOOLKIT (File Handling)
 # ==========================================
 
-def get_full_file_url(base_url: str, relative_url: str) -> str:
-    if not relative_url or relative_url == "NONE": return None
-    return urljoin(base_url, relative_url)
+def is_valid_file_url(base_url: str, relative_url: str) -> str:
+    """Checks if a URL is valid and NOT the webpage itself."""
+    if not relative_url or relative_url.lower() == "none": 
+        return None
+    
+    full_url = urljoin(base_url, relative_url)
+    
+    # LOOP PREVENTION: If the link points to the current page (ignoring query params), ignore it.
+    if full_url.split('?')[0].rstrip('/') == base_url.split('?')[0].rstrip('/'):
+        return None
+        
+    return full_url
 
 async def transcribe_audio_file(file_url: str) -> str:
-    """Downloads audio and uses OpenAI Whisper for transcription."""
-    print(f"    [Tool] Downloading Audio: {file_url}")
+    """Downloads audio and uses OpenAI Whisper."""
+    print(f"    [Tool] 🔊 Processing Audio: {file_url}")
     try:
-        response = requests.get(file_url, stream=True, timeout=15)
+        response = requests.get(file_url, stream=True, timeout=20)
         response.raise_for_status()
         
+        # Verify content type
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'html' in content_type:
+             return "ERROR: The link returned HTML, not Audio. It might be a webpage, not a file."
+
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_filepath = os.path.join(temp_dir, f"audio_{int(time.time())}.mp3")
             with open(temp_filepath, 'wb') as f:
@@ -59,30 +71,38 @@ async def transcribe_audio_file(file_url: str) -> str:
                 )
             return transcription.text.strip()
     except Exception as e:
-        return f"ERROR: Audio processing failed: {e}"
+        return f"ERROR: Audio processing failed: {str(e)}"
 
 async def read_csv_file(file_url: str) -> str:
-    """Downloads and reads a CSV file into text."""
-    print(f"    [Tool] Reading CSV: {file_url}")
+    """Downloads and reads a CSV/Text file."""
+    print(f"    [Tool] 📄 Reading File: {file_url}")
     try:
-        response = requests.get(file_url, timeout=15)
+        response = requests.get(file_url, timeout=20)
         response.raise_for_status()
-        # Decode and return content
+        
+        # Verify content type
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'html' in content_type:
+             return "ERROR: The link returned HTML, not CSV. It might be a webpage, not a file."
+
         return response.content.decode('utf-8')
     except Exception as e:
-        return f"ERROR: CSV processing failed: {e}"
+        return f"ERROR: File processing failed: {str(e)}"
 
 # ==========================================
-# 3. THE SOLVER LOGIC
+# 3. AGENT LOGIC
 # ==========================================
 
 async def solve_quiz_task(task_url: str, email: str, student_secret: str, context_log: str = ""):
     """
-    context_log: Accumulates data found (Transcriptions, CSVs) so we don't lose it on recursion.
+    Recursive Agent:
+    1. Scrapes Page.
+    2. Identifies if files (CSV/Audio) are needed.
+    3. Fetches files -> Updates Context -> Recurses.
+    4. Solves when no files are missing.
     """
-    # CRITICAL FIX: Stop if the URL is None (Prevents crash)
     if not task_url:
-        print("    🛑 Stopped: No valid URL provided.")
+        print("    🛑 Stopped: No valid URL.")
         return
 
     print(f"\n[+] Processing Task: {task_url}")
@@ -92,103 +112,123 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, contex
         page = await browser.new_page()
         
         try:
-            # A. Scrape Page
+            # A. SCRAPE THE WEBPAGE
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
             content = await page.evaluate("document.body.innerText")
             print(f"    Scraped content length: {len(content)} chars")
 
             # ==========================================================
-            # B. INTELLIGENT AGENT LOOP (Find Missing Data)
+            # B. PHASE 1: RESOURCE DETECTION (Look for files)
             # ==========================================================
             
-            # 1. Check for CSV (if mentioned but not yet read)
-            # We check if 'csv' is in text AND we haven't already added it to context
-            if "csv" in content.lower() and "CSV_CONTENT:" not in context_log:
-                print("    [Agent] Detected CSV reference. Extracting URL...")
-                link_prompt = f"Find the CSV file URL in this text: '''{content}'''. Return ONLY the URL string."
-                csv_link_res = client.chat.completions.create(
-                    model="gpt-4o-mini", messages=[{"role": "user", "content": link_prompt}]
-                )
-                csv_rel_url = csv_link_res.choices[0].message.content.strip()
-                full_csv_url = get_full_file_url(task_url, csv_rel_url)
-                
-                if full_csv_url and "http" in full_csv_url:
-                    csv_data = await read_csv_file(full_csv_url)
-                    # Add to context and RECURSE (Run again with new knowledge)
-                    new_context = context_log + f"\n\n=== CSV_CONTENT ===\n{csv_data}\n"
-                    print("    [Agent] CSV Read. Rerunning with new data...")
-                    await browser.close()
-                    await solve_quiz_task(task_url, email, student_secret, new_context)
-                    return
-
-            # 2. Check for Audio (if mentioned but not yet transcribed)
-            if ("audio" in content.lower() or ".mp3" in content.lower()) and "AUDIO_TRANSCRIPT:" not in context_log:
-                print("    [Agent] Detected Audio reference. Extracting URL...")
-                link_prompt = f"Find the Audio/MP3 file URL in this text: '''{content}'''. Return ONLY the URL string."
-                audio_link_res = client.chat.completions.create(
-                    model="gpt-4o-mini", messages=[{"role": "user", "content": link_prompt}]
-                )
-                audio_rel_url = audio_link_res.choices[0].message.content.strip()
-                full_audio_url = get_full_file_url(task_url, audio_rel_url)
-                
-                if full_audio_url and "http" in full_audio_url:
-                    transcript = await transcribe_audio_file(full_audio_url)
-                    # Add to context and RECURSE
-                    new_context = context_log + f"\n\n=== AUDIO_TRANSCRIPT ===\n{transcript}\n"
-                    print("    [Agent] Audio Transcribed. Rerunning with new data...")
-                    await browser.close()
-                    await solve_quiz_task(task_url, email, student_secret, new_context)
-                    return
-
-            # ==========================================================
-            # C. FINAL SOLVER (With all collected context)
-            # ==========================================================
+            # We ask the LLM: "Do we need to download anything to solve the problem?"
+            detection_prompt = f"""
+            You are a Resource Manager. Analyze the webpage text below.
             
-            full_prompt = f"""
-            You are a Data Extractor.
+            Does the text mention any EXTERNAL FILES (CSV, Audio, PDF, Text) that contain instructions or data needed to answer the question?
             
-            INTERNAL DATA:
-            - Email: "{email}"
-            - Secret: "{student_secret}"
+            WEBPAGE TEXT:
+            '''{content}'''
             
-            COLLECTED EVIDENCE (Files/Audio found):
+            ALREADY PROCESSED FILES:
             {context_log}
             
-            PAGE TEXT:
+            INSTRUCTIONS:
+            - If you see a file link that we haven't processed yet, return its URL.
+            - If we have everything we need, return "NONE".
+            - Ignore links that are just navigation (like "Next", "Home").
+            - Prioritize links ending in .csv, .mp3, .txt or mentioned as "Download file".
+            
+            Return ONLY the URL string (or "NONE").
+            """
+
+            detection_res = client.chat.completions.create(
+                model="gpt-4o-mini", messages=[{"role": "user", "content": detection_prompt}]
+            )
+            resource_url = detection_res.choices[0].message.content.strip()
+
+            # ==========================================================
+            # C. PHASE 2: RESOURCE ACQUISITION (Download & Recurse)
+            # ==========================================================
+            
+            full_resource_url = is_valid_file_url(task_url, resource_url)
+
+            # Only proceed if we found a valid URL that is NOT in our history
+            if full_resource_url and full_resource_url not in context_log:
+                print(f"    [Agent] Identified necessary file: {full_resource_url}")
+                
+                # Determine file type heuristically or by guessing
+                file_content = ""
+                
+                if ".mp3" in full_resource_url.lower() or "audio" in full_resource_url.lower():
+                    file_content = await transcribe_audio_file(full_resource_url)
+                    file_label = "AUDIO_TRANSCRIPT"
+                else:
+                    # Default to text/csv reader
+                    file_content = await read_csv_file(full_resource_url)
+                    file_label = "FILE_CONTENT"
+                
+                # Add to memory
+                new_context = context_log + f"\n\n=== SOURCE: {full_resource_url} ({file_label}) ===\n{file_content}\n"
+                
+                print("    [Agent] Resource processed. Rerunning analysis with new data...")
+                await browser.close()
+                # RECURSION: Run the solver again, but now with the file content in memory
+                await solve_quiz_task(task_url, email, student_secret, new_context)
+                return
+
+            # ==========================================================
+            # D. PHASE 3: FINAL SOLVER (Reasoning & Submission)
+            # ==========================================================
+            
+            solve_prompt = f"""
+            You are an automated agent solving a technical quiz.
+            
+            --------------------------------------------------
+            INTERNAL IDENTITY (Use these ONLY if asked for your credentials):
+            - Email: "{email}"
+            - Secret: "{student_secret}"
+            --------------------------------------------------
+            
+            EXTERNAL EVIDENCE (Files/Audio collected):
+            {context_log}
+            
+            CURRENT PAGE TEXT:
             '''
             {content}
             '''
+            --------------------------------------------------
             
-            TASK:
-            1. Find the Submission URL.
-            2. Solve the question.
+            YOUR TASK:
+            1. Identify the "Submission URL".
+            2. Solve the question asked on the page.
             
-            RULES:
-            - If asked for sum/calculation, use the CSV_CONTENT provided above.
-            - If asked for a specific value mentioned in audio, use AUDIO_TRANSCRIPT.
-            - If asked for identity, use INTERNAL DATA.
+            CRITICAL INSTRUCTIONS:
+            - INSTRUCTIONS CAN BE ANYWHERE: The question might be in the 'EXTERNAL EVIDENCE' (e.g., an audio transcript might say "Calculate the sum of column A").
+            - IDENTITY QUESTIONS: If the question asks for "your secret", "password", or "email", you MUST substitute the values from INTERNAL IDENTITY. Do not output literal strings like "your secret".
+            - DATA QUESTIONS: If the question asks for calculations, use the data in EXTERNAL EVIDENCE.
             
-            OUTPUT JSON ONLY:
+            OUTPUT FORMAT (JSON ONLY):
             {{
                 "submission_url": "...",
                 "payload": {{
                     "email": "{email}",
                     "secret": "{student_secret}",
                     "url": "{task_url}",
-                    "answer": <THE_ANSWER>
+                    "answer": <THE_ANSWER_VALUE>
                 }}
             }}
             """
 
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": full_prompt}],
+                messages=[{"role": "user", "content": solve_prompt}],
                 response_format={"type": "json_object"}
             )
 
             ai_data = json.loads(response.choices[0].message.content)
-            submission_url = get_full_file_url(task_url, ai_data.get("submission_url"))
+            submission_url = is_valid_file_url(task_url, ai_data.get("submission_url"))
             payload = ai_data.get("payload")
 
             print(f"    AI Answer: {payload.get('answer')}")
@@ -202,7 +242,6 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, contex
 
                     if result.get("correct") == True:
                         print("    ✅ Correct!")
-                        # CRITICAL: Only recurse if a valid URL exists
                         if result.get("url"):
                             print(f"    Found next level: {result['url']}")
                             await browser.close()
@@ -210,17 +249,14 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, contex
                             return
                         else:
                             print("    🎉 Quiz Complete!")
-                            return
                     else:
                         print("    ❌ Incorrect.")
-                        # SAFETY CHECK: Only recurse if a valid NEW url is provided (skipping)
                         if result.get("url"):
-                            print("    Retrying next URL provided by server...")
+                            print("    ⚠️ Retrying next URL provided by server (skipping current)...")
                             await browser.close()
                             await solve_quiz_task(result["url"], email, student_secret)
-                            return
                         else:
-                            print("    🛑 Game Over. No next URL to proceed.")
+                            print("    🛑 Game Over. Answer wrong and no new URL.")
 
                 except Exception:
                      print(f"    ❌ Error parsing response: {submit_response.text}")
@@ -231,6 +267,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, contex
         if browser.is_connected():
             await browser.close()
 
+# Endpoints
 @app.post("/run")
 async def run_task(request: QuizRequest, background_tasks: BackgroundTasks):
     if request.secret != MY_SECRET:
