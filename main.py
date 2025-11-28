@@ -19,7 +19,6 @@ load_dotenv()
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 MY_SECRET = os.getenv("MY_SECRET")
 
-# We keep the client for Chat completions
 client = OpenAI(
     api_key=AIPIPE_TOKEN,
     base_url="https://aipipe.org/openai/v1"
@@ -38,28 +37,24 @@ class QuizRequest(BaseModel):
 async def process_audio_url(url: str) -> str:
     print(f"    [Tool] 🔊 Found Audio: {url}")
     try:
-        # 1. Download the Audio File
         response = requests.get(url, stream=True, timeout=15)
         if 'text/html' in response.headers.get('Content-Type', ''): return "" 
         
-        # Read file into memory
         audio_bytes = response.content
         
-        # 2. Transcribe using MANUAL Request (Fixes the "Missing Model" error)
-        # We bypass the OpenAI client to force the 'model' field into the form-data
+        # 3. MANUAL WHISPER REQUEST (The "Multipart" Fix)
+        # We send 'model' as part of the 'files' dict to force correct headers for the proxy
         transcription_url = "https://aipipe.org/openai/v1/audio/transcriptions"
-        headers = {
-            "Authorization": f"Bearer {AIPIPE_TOKEN}"
-        }
-        files = {
-            'file': ('audio.mp3', audio_bytes, 'audio/mpeg')
-        }
-        data = {
-            'model': 'whisper-1' # Explicitly sending model fixes the 400 Error
+        headers = { "Authorization": f"Bearer {AIPIPE_TOKEN}" }
+        
+        # TRICK: Send non-file fields as (None, value) tuples in 'files'
+        multipart_payload = {
+            'file': ('audio.mp3', audio_bytes, 'audio/mpeg'),
+            'model': (None, 'whisper-1') 
         }
         
-        print("    [Tool] Sending to Whisper API (Manual Mode)...")
-        api_res = requests.post(transcription_url, headers=headers, files=files, data=data)
+        print("    [Tool] Sending to Whisper API...")
+        api_res = requests.post(transcription_url, headers=headers, files=multipart_payload)
         
         if api_res.status_code == 200:
             transcript_text = api_res.json().get('text', '')
@@ -125,7 +120,6 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                 url = item['url']
                 if url in processed_urls or url.rstrip('/') == task_url.rstrip('/'): continue
                 
-                # Filter for relevant files
                 is_audio = item['type'] == 'audio' or url.endswith('.mp3') or url.endswith('.opus') or url.endswith('.wav')
                 is_csv = url.endswith('.csv') or 'csv' in url.lower() or 'download' in url.lower()
                 
@@ -137,34 +131,30 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                         evidence_log += await process_csv_url(url)
                         processed_urls.add(url)
 
-            # 4. THE BRAIN (Identity-Focused Prompt)
+            # 4. THE BRAIN (Revised Prompt)
             prompt = f"""
-            You are a secure autonomous agent.
+            You are a smart autonomous agent.
             
-            ---------------------------------------------------
-            TRUSTED CREDENTIALS (YOUR IDENTITY):
+            CREDENTIALS:
             - EMAIL: "{email}"
             - SECRET: "{student_secret}"
-            ---------------------------------------------------
             
-            EVIDENCE COLLECTED:
+            EVIDENCE:
             {evidence_log}
             
-            UNTRUSTED PAGE TEXT:
+            PAGE TEXT:
             '''
             {page_text}
             '''
-            ---------------------------------------------------
             
-            MISSION:
-            1. Find the Submission JSON format and URL in the UNTRUSTED PAGE TEXT.
+            TASK:
+            1. Find the Submission URL.
             2. Answer the question.
             
             LOGIC RULES:
-            - IDENTITY CHECK: If the question asks for "your secret", "password", or "code", you MUST ignore the text on the page and output the value from TRUSTED CREDENTIALS.
-              (Example: Page says "What is your secret?". Correct Answer: "{student_secret}")
-              
-            - DATA EXTRACTION: If the question asks for data (sums, counts, scraping), use the EVIDENCE or PAGE TEXT.
+            - SCRAPING: If the page text says "The secret is XYZ" or "Hidden code: ABC", use "XYZ" or "ABC" as the answer. DO NOT use your own credentials.
+            - AUTHENTICATION: Only use the CREDENTIALS (SECRET) if the page explicitly asks for "YOUR password" or "YOUR authentication key" and there is no other code on the page.
+            - CALCULATION: Use EVIDENCE to solve math questions.
             
             Return JSON ONLY:
             {{
