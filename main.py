@@ -31,80 +31,51 @@ class QuizRequest(BaseModel):
     url: str
 
 # ==========================================
-# 2. TOOLKIT (File Handling)
+# 2. FILE PROCESSING TOOLS
 # ==========================================
 
-def is_valid_file_url(base_url: str, relative_url: str) -> str:
-    """Checks if a URL is valid and NOT the webpage itself."""
-    if not relative_url or relative_url.lower() == "none": 
-        return None
-    
-    full_url = urljoin(base_url, relative_url)
-    
-    # LOOP PREVENTION: If the link points to the current page (ignoring query params), ignore it.
-    if full_url.split('?')[0].rstrip('/') == base_url.split('?')[0].rstrip('/'):
-        return None
-        
-    return full_url
-
-async def transcribe_audio_file(file_url: str) -> str:
-    """Downloads audio and uses OpenAI Whisper."""
-    print(f"    [Tool] 🔊 Processing Audio: {file_url}")
+async def process_audio_url(url: str) -> str:
+    print(f"    [Tool] 🔊 Found Audio: {url}")
     try:
-        response = requests.get(file_url, stream=True, timeout=20)
-        response.raise_for_status()
+        response = requests.get(url, stream=True, timeout=15)
+        # Security: Ignore if it downloads a webpage instead of audio
+        if 'text/html' in response.headers.get('Content-Type', ''): return "" 
         
-        # Verify content type
-        content_type = response.headers.get('Content-Type', '').lower()
-        if 'html' in content_type:
-             return "ERROR: The link returned HTML, not Audio. It might be a webpage, not a file."
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_filepath = os.path.join(temp_dir, f"audio_{int(time.time())}.mp3")
-            with open(temp_filepath, 'wb') as f:
+            path = os.path.join(temp_dir, f"audio_{int(time.time())}.mp3")
+            with open(path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
             
-            with open(temp_filepath, "rb") as audio_file:
-                transcription = client.audio.transcriptions.create(
-                    model="whisper-1", file=audio_file
-                )
-            return transcription.text.strip()
+            with open(path, "rb") as audio_file:
+                # Use Whisper to transcribe
+                transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+            print(f"    [Tool] Transcription: {transcript.text[:50]}...")
+            return f"\n[AUDIO TRANSCRIPT FROM {url}]\n{transcript.text}\n"
     except Exception as e:
-        return f"ERROR: Audio processing failed: {str(e)}"
+        print(f"    [Tool] Audio Error: {e}")
+        return ""
 
-async def read_csv_file(file_url: str) -> str:
-    """Downloads and reads a CSV/Text file."""
-    print(f"    [Tool] 📄 Reading File: {file_url}")
+async def process_csv_url(url: str) -> str:
+    print(f"    [Tool] 📊 Found CSV/Data: {url}")
     try:
-        response = requests.get(file_url, timeout=20)
-        response.raise_for_status()
+        response = requests.get(url, timeout=15)
+        # Security: Ignore if it downloads a webpage
+        if 'text/html' in response.headers.get('Content-Type', ''): return ""
         
-        # Verify content type
-        content_type = response.headers.get('Content-Type', '').lower()
-        if 'html' in content_type:
-             return "ERROR: The link returned HTML, not CSV. It might be a webpage, not a file."
-
-        return response.content.decode('utf-8')
+        content = response.content.decode('utf-8')
+        print(f"    [Tool] CSV Content: {len(content)} chars")
+        return f"\n[CSV FILE CONTENT FROM {url}]\n{content}\n"
     except Exception as e:
-        return f"ERROR: File processing failed: {str(e)}"
+        print(f"    [Tool] CSV Error: {e}")
+        return ""
 
 # ==========================================
-# 3. AGENT LOGIC
+# 3. MAIN SOLVER LOGIC
 # ==========================================
 
-async def solve_quiz_task(task_url: str, email: str, student_secret: str, context_log: str = ""):
-    """
-    Recursive Agent:
-    1. Scrapes Page.
-    2. Identifies if files (CSV/Audio) are needed.
-    3. Fetches files -> Updates Context -> Recurses.
-    4. Solves when no files are missing.
-    """
-    if not task_url:
-        print("    🛑 Stopped: No valid URL.")
-        return
-
+async def solve_quiz_task(task_url: str, email: str, student_secret: str):
+    if not task_url: return
     print(f"\n[+] Processing Task: {task_url}")
     
     async with async_playwright() as p:
@@ -112,162 +83,125 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str, contex
         page = await browser.new_page()
         
         try:
-            # A. SCRAPE THE WEBPAGE
+            # 1. NAVIGATE & WAIT
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
-            content = await page.evaluate("document.body.innerText")
-            print(f"    Scraped content length: {len(content)} chars")
+            
+            # 2. INTELLIGENT SCRAPING (Code-based, not AI-based)
+            # We extract links directly from DOM to ensure we don't miss anything.
+            page_text = await page.evaluate("document.body.innerText")
+            
+            # Extract hrefs for CSVs and SRCs for Audio using JavaScript
+            media_links = await page.evaluate("""() => {
+                let links = [];
+                // Get all Anchor tags
+                document.querySelectorAll('a').forEach(a => {
+                    if (a.href) links.push({url: a.href, type: 'link'});
+                });
+                // Get all Audio tags
+                document.querySelectorAll('audio, source').forEach(el => {
+                    if (el.src) links.push({url: el.src, type: 'audio'});
+                });
+                return links;
+            }""")
 
-            # ==========================================================
-            # B. PHASE 1: RESOURCE DETECTION (Look for files)
-            # ==========================================================
+            # 3. GATHER EVIDENCE (Download Loop)
+            evidence_log = ""
+            processed_urls = set()
             
-            # We ask the LLM: "Do we need to download anything to solve the problem?"
-            detection_prompt = f"""
-            You are a Resource Manager. Analyze the webpage text below.
+            for item in media_links:
+                url = item['url']
+                # Skip if already processed or if it's the current page itself
+                if url in processed_urls or url.rstrip('/') == task_url.rstrip('/'): continue
+                
+                # Heuristics to decide what to download
+                is_audio = item['type'] == 'audio' or url.endswith('.mp3') or url.endswith('.wav')
+                is_csv = url.endswith('.csv') or 'csv' in url.lower() or 'download' in url.lower()
+                
+                if is_audio:
+                    evidence_log += await process_audio_url(url)
+                    processed_urls.add(url)
+                elif is_csv:
+                    # Double check it's not a navigation link
+                    if not url.endswith('.html') and '/page/' not in url:
+                        evidence_log += await process_csv_url(url)
+                        processed_urls.add(url)
+
+            # 4. THE BRAIN (LLM SOLVER)
+            # We give the LLM a strong persona to fix the Secret/Email issue.
+            prompt = f"""
+            You are the user with the following credentials:
+            - EMAIL: "{email}"
+            - SECRET: "{student_secret}"
             
-            Does the text mention any EXTERNAL FILES (CSV, Audio, PDF, Text) that contain instructions or data needed to answer the question?
+            You are solving a quiz. 
+            
+            EVIDENCE COLLECTED:
+            {evidence_log}
             
             WEBPAGE TEXT:
-            '''{content}'''
-            
-            ALREADY PROCESSED FILES:
-            {context_log}
+            '''
+            {page_text}
+            '''
             
             INSTRUCTIONS:
-            - If you see a file link that we haven't processed yet, return its URL.
-            - If we have everything we need, return "NONE".
-            - Ignore links that are just navigation (like "Next", "Home").
-            - Prioritize links ending in .csv, .mp3, .txt or mentioned as "Download file".
+            1. Parse the page to find the Submission JSON format and URL.
+            2. Answer the question based on the EVIDENCE and WEBPAGE TEXT.
+            3. IDENTITY RULE: If the question asks for "your secret", "password", or "email", you MUST output your actual credentials (from above), NOT the placeholder text.
+            4. DATA RULE: If the question requires calculation, perform it using the data in the EVIDENCE block.
             
-            Return ONLY the URL string (or "NONE").
-            """
-
-            detection_res = client.chat.completions.create(
-                model="gpt-4o-mini", messages=[{"role": "user", "content": detection_prompt}]
-            )
-            resource_url = detection_res.choices[0].message.content.strip()
-
-            # ==========================================================
-            # C. PHASE 2: RESOURCE ACQUISITION (Download & Recurse)
-            # ==========================================================
-            
-            full_resource_url = is_valid_file_url(task_url, resource_url)
-
-            # Only proceed if we found a valid URL that is NOT in our history
-            if full_resource_url and full_resource_url not in context_log:
-                print(f"    [Agent] Identified necessary file: {full_resource_url}")
-                
-                # Determine file type heuristically or by guessing
-                file_content = ""
-                
-                if ".mp3" in full_resource_url.lower() or "audio" in full_resource_url.lower():
-                    file_content = await transcribe_audio_file(full_resource_url)
-                    file_label = "AUDIO_TRANSCRIPT"
-                else:
-                    # Default to text/csv reader
-                    file_content = await read_csv_file(full_resource_url)
-                    file_label = "FILE_CONTENT"
-                
-                # Add to memory
-                new_context = context_log + f"\n\n=== SOURCE: {full_resource_url} ({file_label}) ===\n{file_content}\n"
-                
-                print("    [Agent] Resource processed. Rerunning analysis with new data...")
-                await browser.close()
-                # RECURSION: Run the solver again, but now with the file content in memory
-                await solve_quiz_task(task_url, email, student_secret, new_context)
-                return
-
-            # ==========================================================
-            # D. PHASE 3: FINAL SOLVER (Reasoning & Submission)
-            # ==========================================================
-            
-            solve_prompt = f"""
-            You are an automated agent solving a technical quiz.
-            
-            --------------------------------------------------
-            INTERNAL IDENTITY (Use these ONLY if asked for your credentials):
-            - Email: "{email}"
-            - Secret: "{student_secret}"
-            --------------------------------------------------
-            
-            EXTERNAL EVIDENCE (Files/Audio collected):
-            {context_log}
-            
-            CURRENT PAGE TEXT:
-            '''
-            {content}
-            '''
-            --------------------------------------------------
-            
-            YOUR TASK:
-            1. Identify the "Submission URL".
-            2. Solve the question asked on the page.
-            
-            CRITICAL INSTRUCTIONS:
-            - INSTRUCTIONS CAN BE ANYWHERE: The question might be in the 'EXTERNAL EVIDENCE' (e.g., an audio transcript might say "Calculate the sum of column A").
-            - IDENTITY QUESTIONS: If the question asks for "your secret", "password", or "email", you MUST substitute the values from INTERNAL IDENTITY. Do not output literal strings like "your secret".
-            - DATA QUESTIONS: If the question asks for calculations, use the data in EXTERNAL EVIDENCE.
-            
-            OUTPUT FORMAT (JSON ONLY):
+            Return JSON ONLY:
             {{
                 "submission_url": "...",
-                "payload": {{
-                    "email": "{email}",
-                    "secret": "{student_secret}",
-                    "url": "{task_url}",
-                    "answer": <THE_ANSWER_VALUE>
-                }}
+                "payload": {{ ...correct json payload... }}
             }}
             """
 
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": solve_prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
 
             ai_data = json.loads(response.choices[0].message.content)
-            submission_url = is_valid_file_url(task_url, ai_data.get("submission_url"))
+            submission_url = ai_data.get("submission_url")
             payload = ai_data.get("payload")
+            
+            # Handle relative URLs
+            if submission_url and not submission_url.startswith("http"):
+                submission_url = urljoin(task_url, submission_url)
 
             print(f"    AI Answer: {payload.get('answer')}")
             print(f"    Submitting to: {submission_url}")
 
+            # 5. SUBMIT & RECURSE
             if submission_url:
-                submit_response = requests.post(submission_url, json=payload)
+                submit_res = requests.post(submission_url, json=payload)
                 try:
-                    result = submit_response.json()
-                    print(f"    Server Response: {result}")
-
-                    if result.get("correct") == True:
+                    res_json = submit_res.json()
+                    print(f"    Server: {res_json}")
+                    
+                    if res_json.get("correct") == True:
                         print("    ✅ Correct!")
-                        if result.get("url"):
-                            print(f"    Found next level: {result['url']}")
+                        if res_json.get("url"):
                             await browser.close()
-                            await solve_quiz_task(result["url"], email, student_secret)
-                            return
-                        else:
-                            print("    🎉 Quiz Complete!")
+                            await solve_quiz_task(res_json["url"], email, student_secret)
+                    elif res_json.get("url"):
+                         print("    ⚠️ Incorrect, but retrying next level...")
+                         await browser.close()
+                         await solve_quiz_task(res_json["url"], email, student_secret)
                     else:
-                        print("    ❌ Incorrect.")
-                        if result.get("url"):
-                            print("    ⚠️ Retrying next URL provided by server (skipping current)...")
-                            await browser.close()
-                            await solve_quiz_task(result["url"], email, student_secret)
-                        else:
-                            print("    🛑 Game Over. Answer wrong and no new URL.")
-
+                        print("    ❌ Game Over.")
+                        
                 except Exception:
-                     print(f"    ❌ Error parsing response: {submit_response.text}")
+                    print(f"    ❌ Error: {submit_res.text}")
 
         except Exception as e:
-            print(f"    Error during processing: {e}")
+            print(f"    Error: {e}")
         
         if browser.is_connected():
             await browser.close()
 
-# Endpoints
 @app.post("/run")
 async def run_task(request: QuizRequest, background_tasks: BackgroundTasks):
     if request.secret != MY_SECRET:
