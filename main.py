@@ -156,7 +156,10 @@ def execute_logic(csv_data: dict, operation: str, threshold: float = None, email
     if "decimal" in operation or "invoice" in operation:
         return round(val, 2)
         
-    return int(val) if val.is_integer() else val
+    # FIX: Safely convert float to int if strictly integer
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    return val
 
 # ==========================================
 # MAIN LOGIC
@@ -237,7 +240,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             1. COMMANDS: "Craft a command" (uv/git/curl) -> Output command string.
             2. LISTS: "Return a JSON array", "Filter rows" -> Use 'filter_list'.
             3. MATH: "Sum", "Count", "Total" -> Use 'sum'/'count'.
-            4. GENERAL: "What is...", "Code?", "Color?" -> Extract exact value.
+            4. GENERAL: "What is...", "Code?", "Color?" -> Extract exact value. Avoid placeholders like "#rrggbb".
             """
             
             user_content = [{"type": "text", "text": user_text_prompt}]
@@ -277,7 +280,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             if gen_cmd and ("curl" in gen_cmd or "uv" in gen_cmd or "git" in gen_cmd or "grep" in gen_cmd):
                 final_answer = gen_cmd
             
-            elif plan.get("general_answer") and str(plan["general_answer"]).lower() not in ["hello", "your secret", "email", "code", "null"]:
+            elif plan.get("general_answer") and str(plan["general_answer"]).lower() not in ["hello", "your secret", "email", "code", "null", "#rrggbb"]:
                 final_answer = plan["general_answer"]
             
             # Fallback Logic
