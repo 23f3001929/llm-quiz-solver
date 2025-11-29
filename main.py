@@ -242,8 +242,9 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             final_answer = None
             
             # Priority A: CLI Command Generation (Strict check to avoid Invoice false positives)
-            if plan.get("generated_command") and "curl" in plan["generated_command"] or "uv" in plan["generated_command"] or "git" in plan["generated_command"]:
-                final_answer = plan["generated_command"]
+            gen_cmd = plan.get("generated_command")
+            if gen_cmd and ("curl" in gen_cmd or "uv" in gen_cmd or "git" in gen_cmd):
+                final_answer = gen_cmd
             
             # Priority B: General Answer (Links, Colors, Phrases)
             elif plan.get("general_answer") and str(plan["general_answer"]).lower() not in ["hello", "your secret", "email", "code", "null"]:
