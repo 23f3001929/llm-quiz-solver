@@ -45,11 +45,7 @@ async def process_audio_google(url: str) -> str:
             with open(orig_path, "wb") as f: f.write(resp.content)
             
             wav_path = os.path.join(temp_dir, "converted.wav")
-            # Audio conversion (requires ffmpeg)
-            try:
-                AudioSegment.from_file(orig_path).export(wav_path, format="wav")
-            except:
-                return "\n[ERROR] Audio conversion failed. FFmpeg missing?\n"
+            AudioSegment.from_file(orig_path).export(wav_path, format="wav")
             
             r = sr.Recognizer()
             with sr.AudioFile(wav_path) as source:
@@ -74,9 +70,7 @@ async def process_csv_url(url: str) -> list:
         return []
 
 def execute_math_logic(numbers: list, operation: str, threshold: float = None):
-    """
-    Executes the logic decided by the AI on the CSV numbers.
-    """
+    """Executes the logic decided by the AI."""
     if not numbers: return 0
     
     filtered_nums = numbers
@@ -86,7 +80,7 @@ def execute_math_logic(numbers: list, operation: str, threshold: float = None):
         elif "less" in operation or "<" in operation:
             filtered_nums = [n for n in numbers if n < threshold]
     
-    if not filtered_nums: return 0 # Avoid crash on empty list
+    if not filtered_nums: return 0 
 
     if "sum" in operation:
         val = sum(filtered_nums)
@@ -118,10 +112,10 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             await page.goto(task_url)
             await page.wait_for_selector("body", timeout=15000)
             
-            # Scrape visible text AND hidden code blocks
+            # Scrape visible text AND special tags
             page_text = await page.evaluate("""() => {
                 return document.body.innerText + "\\n" + 
-                       Array.from(document.querySelectorAll('code, pre, .secret')).map(e => e.innerText).join("\\n");
+                       Array.from(document.querySelectorAll('code, pre, .secret, .code')).map(e => e.innerText).join("\\n");
             }""")
 
             # 1. EXTRACT LINKS
@@ -152,7 +146,11 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
 
             # 3. ASK AI FOR THE PLAN
             prompt = f"""
-            You are a Logic Engine.
+            You are a Logic Extraction Engine.
+            
+            === USER IDENTITY ===
+            EMAIL: "{email}"
+            SECRET: "{student_secret}"
             
             === PAGE TEXT ===
             {page_text}
@@ -161,19 +159,20 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             {evidence_text}
             
             === MISSION ===
-            Return a JSON object describing HOW to solve the problem.
+            Analyze the instructions and decide the answer strategy.
             
-            1. SCRAPING: Is there a secret code mentioned on the page (e.g. "Cutoff is 5000", "Secret: XYZ")? 
-               IGNORE placeholders like "your secret", "email", "code". Look for REAL values.
-            2. MATH LOGIC: What calculation should be performed on the CSV numbers?
+            1. COMMAND CRAFTING: If the page asks to "Craft a command string" (e.g. using 'uv', 'curl'), construct it exactly as requested, substituting your email/secret if needed.
+            2. SCRAPING: Is there a secret code mentioned (e.g. "Cutoff is 5000", "Secret: XYZ")? Extract it.
+            3. MATH LOGIC: What calculation should be performed on the CSV numbers?
             
             Return JSON ONLY:
             {{
                 "submission_url": "URL found on page",
-                "secret_code_found": "The actual code/value found (or null if it's just instruction text)",
-                "math_operation": "sum/count/average/max",
+                "generated_command": "The command string requested (or null)",
+                "secret_code_found": "The code found in text (or null)",
+                "math_operation": "sum/count/average/max (or null)",
                 "math_filter": "greater_than/less_than/none",
-                "math_threshold": 12345 (number found in text/audio, or null)
+                "math_threshold": 12345 (number or null)
             }}
             """
 
@@ -186,49 +185,43 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             plan = json.loads(response.choices[0].message.content)
             print(f"    [AI Plan] {plan}")
 
-            # 4. EXECUTE THE PLAN (Python Logic)
+            # 4. EXECUTE THE PLAN
             final_answer = None
             
-            # Step A: Validate the scraped code
-            # If the AI scraped "your secret" or "code", it's garbage. Ignore it.
-            scraped = plan.get("secret_code_found")
-            if scraped and str(scraped).lower() in ["your secret", "secret", "code", "email", "password"]:
-                print(f"    [Logic] Ignored placeholder code: {scraped}")
-                scraped = None
-
-            # Step B: Priority Logic
-            # 1. If we have CSV numbers and a Math Operation, DO MATH.
-            if csv_numbers and plan.get("math_operation") and plan.get("math_operation") != "none":
+            # Priority A: Command Generation (Fix for project2-uv)
+            if plan.get("generated_command"):
+                final_answer = plan["generated_command"]
+            
+            # Priority B: Scraped Secret
+            elif plan.get("secret_code_found") and str(plan["secret_code_found"]).lower() not in ["your secret", "email", "code"]:
+                final_answer = plan["secret_code_found"]
+            
+            # Priority C: Math Calculation
+            elif csv_numbers:
                 op = plan.get("math_operation", "sum")
                 filt = plan.get("math_filter", "none")
                 thresh = plan.get("math_threshold")
-                
-                # Clean threshold
                 if thresh is not None:
                     try: thresh = float(str(thresh).replace(',',''))
                     except: thresh = None
                 
                 op_key = f"{op}_{filt}"
                 final_answer = execute_math_logic(csv_numbers, op_key, thresh)
-                print(f"    [Math] Executed {op} with threshold {thresh} -> {final_answer}")
-            
-            # 2. If no math, use the scraped code (if valid)
-            elif scraped:
-                final_answer = scraped
-                
-            # 3. Fallback: Use Student Secret
-            else:
-                final_answer = student_secret
+                print(f"    [Math] Executed {op} -> {final_answer}")
+
+            # Priority D: Fallback
+            if not final_answer:
+                # If page explicitly asks for "your secret", use it.
+                if "secret" in page_text.lower() and "input" in page_text.lower():
+                    final_answer = student_secret
+                else:
+                    final_answer = student_secret 
 
             # 5. SUBMIT
             submission_url = plan.get("submission_url")
             if submission_url and not submission_url.startswith("http"):
                 submission_url = urljoin(task_url, submission_url)
             
-            # Ultimate Safety Net: If final answer is literally "your secret", swap it.
-            if str(final_answer).lower() == "your secret":
-                final_answer = student_secret
-
             payload = {
                 "email": email,
                 "secret": student_secret,
@@ -240,12 +233,18 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             print(f"    Submitting to: {submission_url}")
 
             if submission_url:
-                res = requests.post(submission_url, json=payload).json()
-                print("    Server:", res)
+                res = requests.post(submission_url, json=payload)
                 
-                if res.get("url"):
-                    await browser.close()
-                    await solve_quiz_task(res["url"], email, student_secret)
+                # Enhanced Error Handling for Non-JSON responses
+                try:
+                    res_json = res.json()
+                    print("    Server:", res_json)
+                    if res_json.get("url"):
+                        await browser.close()
+                        await solve_quiz_task(res_json["url"], email, student_secret)
+                except Exception:
+                    print(f"    ❌ Server returned non-JSON error. Status: {res.status_code}")
+                    print(f"    Response Body: {res.text[:300]}") # Print first 300 chars to debug
 
         except Exception as e:
             print("    Error:", e)
