@@ -69,7 +69,7 @@ async def process_csv_url(url: str) -> list:
     except:
         return []
 
-def execute_math_logic(numbers: list, operation: str, threshold: float = None):
+def execute_math_logic(numbers: list, operation: str, threshold: float = None, email: str = ""):
     """Executes the logic decided by the AI."""
     if not numbers: return 0
     
@@ -82,6 +82,7 @@ def execute_math_logic(numbers: list, operation: str, threshold: float = None):
     
     if not filtered_nums: return 0 
 
+    val = 0
     if "sum" in operation:
         val = sum(filtered_nums)
     elif "count" in operation:
@@ -93,7 +94,17 @@ def execute_math_logic(numbers: list, operation: str, threshold: float = None):
     elif "average" in operation:
         val = sum(filtered_nums) / len(filtered_nums)
     else:
-        val = sum(numbers) 
+        val = sum(numbers)
+        
+    # LOGS CHALLENGE: "Sum bytes + email length mod 5"
+    if "mod 5" in operation or "offset" in operation:
+        offset = len(email) % 5
+        print(f"    [Math] Adding offset (email len {len(email)} % 5) = {offset}")
+        val += offset
+        
+    # INVOICE CHALLENGE: Round to 2 decimals
+    if "decimal" in operation or "invoice" in operation:
+        return round(val, 2)
         
     return int(val) if val.is_integer() else val
 
@@ -161,19 +172,19 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             === MISSION ===
             Analyze the instructions and decide the answer strategy.
             
-            1. COMMAND CRAFTING: If the page asks to "Craft a command string", construct it exactly as requested.
-               - NOTE: For 'uv', the format is often `uv http get <URL> --header "Header: Value"`. Ensure you substitute the email/secret if the template asks for it.
-            2. SCRAPING: Is there a secret code mentioned (e.g. "Cutoff is 5000", "Secret: XYZ")? Extract it.
-            3. MATH LOGIC: What calculation should be performed on the CSV numbers?
+            1. COMMAND CRAFTING: If asked to "Craft a command", construct it exactly.
+            2. GENERAL QUESTION: If asked for a specific value (e.g., "What is the link?", "Dominant color?", "Code phrase?"), extract that EXACT string/value.
+            3. MATH LOGIC: If calculation needed on CSV, describe it. (e.g. "sum with mod 5 offset").
             
             Return JSON ONLY:
             {{
-                "submission_url": "The HTTP Endpoint to POST the answer to (e.g. /submit)",
-                "generated_command": "The command string requested (or null)",
-                "secret_code_found": "The code found in text (or null)",
+                "submission_url": "URL found on page",
+                "generated_command": "Command string (or null)",
+                "general_answer": "Extracted text answer (or null)",
                 "math_operation": "sum/count/average/max (or null)",
                 "math_filter": "greater_than/less_than/none",
-                "math_threshold": 12345 (number or null)
+                "math_threshold": 12345 (number or null),
+                "is_invoice_or_decimal": boolean
             }}
             """
 
@@ -189,30 +200,35 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             # 4. EXECUTE THE PLAN
             final_answer = None
             
-            # Priority A: Command Generation (Fix for project2-uv)
+            # Priority A: Command Generation
             if plan.get("generated_command"):
                 final_answer = plan["generated_command"]
             
-            # Priority B: Scraped Secret
-            elif plan.get("secret_code_found") and str(plan["secret_code_found"]).lower() not in ["your secret", "email", "code"]:
-                final_answer = plan["secret_code_found"]
+            # Priority B: General Answer (Links, Colors, Phrases)
+            elif plan.get("general_answer") and str(plan["general_answer"]).lower() not in ["hello", "your secret", "email", "code", "null"]:
+                final_answer = plan["general_answer"]
             
             # Priority C: Math Calculation
             elif csv_numbers:
-                op = plan.get("math_operation", "sum")
+                op = plan.get("math_operation", "sum") or "sum"
                 filt = plan.get("math_filter", "none")
                 thresh = plan.get("math_threshold")
+                
                 if thresh is not None:
                     try: thresh = float(str(thresh).replace(',',''))
                     except: thresh = None
                 
+                # Check for special modifiers in operation name
                 op_key = f"{op}_{filt}"
-                final_answer = execute_math_logic(csv_numbers, op_key, thresh)
+                if plan.get("is_invoice_or_decimal"): op_key += "_decimal"
+                # Pass email for "mod 5" logic
+                if "mod" in str(page_text).lower() or "offset" in str(page_text).lower(): op_key += "_mod5"
+
+                final_answer = execute_math_logic(csv_numbers, op_key, thresh, email)
                 print(f"    [Math] Executed {op} -> {final_answer}")
 
             # Priority D: Fallback
             if not final_answer:
-                # If page explicitly asks for "your secret", use it.
                 if "secret" in page_text.lower() and "input" in page_text.lower():
                     final_answer = student_secret
                 else:
@@ -221,13 +237,10 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             # 5. SUBMIT (With Safety Check)
             submission_url = plan.get("submission_url")
             
-            # Fix Relative URLs
             if submission_url:
                 if not submission_url.startswith("http"):
                     submission_url = urljoin(task_url, submission_url)
             
-            # CRITICAL FIX: If AI tries to submit to the Task URL itself, redirect to /submit
-            # This handles cases where instructions say "submit with url=..." and AI gets confused
             parsed_task = urlparse(task_url)
             parsed_sub = urlparse(submission_url)
             
