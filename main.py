@@ -4,7 +4,7 @@ import re
 import asyncio
 import requests
 import tempfile
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -168,7 +168,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             
             Return JSON ONLY:
             {{
-                "submission_url": "URL found on page",
+                "submission_url": "The HTTP Endpoint to POST the answer to (e.g. /submit)",
                 "generated_command": "The command string requested (or null)",
                 "secret_code_found": "The code found in text (or null)",
                 "math_operation": "sum/count/average/max (or null)",
@@ -218,11 +218,23 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                 else:
                     final_answer = student_secret 
 
-            # 5. SUBMIT
+            # 5. SUBMIT (With Safety Check)
             submission_url = plan.get("submission_url")
-            if submission_url and not submission_url.startswith("http"):
-                submission_url = urljoin(task_url, submission_url)
             
+            # Fix Relative URLs
+            if submission_url:
+                if not submission_url.startswith("http"):
+                    submission_url = urljoin(task_url, submission_url)
+            
+            # CRITICAL FIX: If AI tries to submit to the Task URL itself, redirect to /submit
+            # This handles cases where instructions say "submit with url=..." and AI gets confused
+            parsed_task = urlparse(task_url)
+            parsed_sub = urlparse(submission_url)
+            
+            if parsed_sub.path == parsed_task.path:
+                print("    ⚠️ AI tried to submit to the Task URL. Redirecting to /submit...")
+                submission_url = f"{parsed_task.scheme}://{parsed_task.netloc}/submit"
+
             payload = {
                 "email": email,
                 "secret": student_secret,
@@ -236,7 +248,6 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             if submission_url:
                 res = requests.post(submission_url, json=payload)
                 
-                # Enhanced Error Handling for Non-JSON responses
                 try:
                     res_json = res.json()
                     print("    Server:", res_json)
@@ -245,7 +256,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                         await solve_quiz_task(res_json["url"], email, student_secret)
                 except Exception:
                     print(f"    ❌ Server returned non-JSON error. Status: {res.status_code}")
-                    print(f"    Response Body: {res.text[:300]}") # Print first 300 chars to debug
+                    print(f"    Response Body: {res.text[:300]}")
 
         except Exception as e:
             print("    Error:", e)
