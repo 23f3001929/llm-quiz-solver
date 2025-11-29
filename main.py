@@ -161,7 +161,8 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             === MISSION ===
             Analyze the instructions and decide the answer strategy.
             
-            1. COMMAND CRAFTING: If the page asks to "Craft a command string" (e.g. using 'uv', 'curl'), construct it exactly as requested, substituting your email/secret if needed.
+            1. COMMAND CRAFTING: If the page asks to "Craft a command string", construct it exactly as requested.
+               - NOTE: For 'uv', the format is often `uv http get <URL> --header "Header: Value"`. Ensure you substitute the email/secret if the template asks for it.
             2. SCRAPING: Is there a secret code mentioned (e.g. "Cutoff is 5000", "Secret: XYZ")? Extract it.
             3. MATH LOGIC: What calculation should be performed on the CSV numbers?
             
