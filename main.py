@@ -4,6 +4,8 @@ import re
 import asyncio
 import requests
 import tempfile
+import csv
+import io
 from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -59,34 +61,62 @@ async def process_audio_google(url: str) -> str:
         return ""
 
 async def process_csv_url(url: str) -> dict:
-    """Downloads CSV and returns both raw text and numbers."""
+    """Downloads CSV and returns content, parsed numbers, and raw lines."""
     print(f"    [Tool] 📊 Fetching CSV Data: {url}")
     try:
         r = requests.get(url, timeout=15)
         content = r.content.decode("utf-8", errors="replace")
-        # Extract numbers for math
+        
+        # Extract all numbers for math
         nums = [float(x) for x in re.findall(r'-?\d+\.?\d*', content.replace(',', ''))]
-        # Return object with content for filtering
-        return {"content": content, "numbers": nums, "lines": content.splitlines()}
-    except:
-        return {"content": "", "numbers": [], "lines": []}
+        
+        # Parse properly to handle structure if needed
+        rows = []
+        try:
+            reader = csv.reader(io.StringIO(content))
+            rows = list(reader)
+        except:
+            pass
 
-def execute_logic(csv_data: dict, operation: str, threshold: float = None, email: str = ""):
+        return {
+            "content": content, 
+            "numbers": nums, 
+            "lines": content.splitlines(),
+            "rows": rows
+        }
+    except:
+        return {"content": "", "numbers": [], "lines": [], "rows": []}
+
+def execute_logic(csv_data: dict, operation: str, threshold: float = None, email: str = "", mod_n: int = 0):
     """Executes math OR list filtering."""
     numbers = csv_data.get("numbers", [])
     lines = csv_data.get("lines", [])
     
     # --- LIST FILTERING MODE (For "Return a JSON array") ---
-    if "filter_list" in operation:
-        # Simple heuristic: return lines/rows containing numbers > threshold
+    # Used when server asks for "rows" or "items" instead of a sum
+    if "filter" in operation and "list" in operation:
         results = []
-        if threshold is not None:
-            for line in lines:
-                # Find numbers in this line
-                line_nums = [float(x) for x in re.findall(r'-?\d+\.?\d*', line.replace(',', ''))]
-                if any(n > threshold for n in line_nums) if "greater" in operation else any(n < threshold for n in line_nums):
-                    results.append(line.strip())
-        return results # Return list, not number
+        # Fallback if no threshold found but filter requested: return all
+        if threshold is None: 
+            return lines[:50] # Limit to avoid huge payload if logic fails
+            
+        for line in lines:
+            # Find numbers in this line
+            line_nums = [float(x) for x in re.findall(r'-?\d+\.?\d*', line.replace(',', ''))]
+            if not line_nums: continue
+            
+            # Check condition
+            match = False
+            if "greater" in operation or ">" in operation:
+                match = any(n > threshold for n in line_nums)
+            elif "less" in operation or "<" in operation:
+                match = any(n < threshold for n in line_nums)
+            
+            if match:
+                results.append(line.strip())
+        
+        print(f"    [Logic] Filtered list size: {len(results)}")
+        return results
 
     # --- MATH MODE ---
     if not numbers: return 0
@@ -98,7 +128,8 @@ def execute_logic(csv_data: dict, operation: str, threshold: float = None, email
         elif "less" in operation or "<" in operation:
             filtered_nums = [n for n in numbers if n < threshold]
     
-    if not filtered_nums: return 0 
+    # Default to sum if list is empty to prevent crash
+    if not filtered_nums: filtered_nums = numbers 
 
     val = 0
     if "sum" in operation:
@@ -114,11 +145,14 @@ def execute_logic(csv_data: dict, operation: str, threshold: float = None, email
     else:
         val = sum(numbers)
         
-    # Special Logics
-    if "mod 5" in operation or "offset" in operation:
-        offset = len(email) % 5
+    # LOGS CHALLENGE: "Sum bytes + email length mod N"
+    # We apply the modulo offset if the AI detected it or if passed explicitly
+    if mod_n > 0:
+        offset = len(email) % mod_n
+        print(f"    [Math] Adding dynamic offset (email len {len(email)} % {mod_n}) = {offset}")
         val += offset
         
+    # INVOICE CHALLENGE: Round to 2 decimals
     if "decimal" in operation or "invoice" in operation:
         return round(val, 2)
         
@@ -155,7 +189,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             }""")
 
             evidence_text = ""
-            csv_data = {"content": "", "numbers": [], "lines": []}
+            csv_data = {"content": "", "numbers": [], "lines": [], "rows": []}
             image_urls = []
             
             # 2. PROCESS MEDIA
@@ -168,7 +202,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                 u_low = url.lower()
                 
                 if item['type'] == 'image':
-                    image_urls.append(url) # Save for Vision
+                    image_urls.append(url)
                     
                 elif u_low.endswith(('.mp3', '.wav', '.opus', '.m4a')) or item['type'] == 'audio':
                     if not u_low.endswith('.csv'):
@@ -178,52 +212,50 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                     csv_data = await process_csv_url(url)
                     evidence_text += f"\n[CSV FILE FOUND]: Contains {len(csv_data['numbers'])} numbers.\n"
 
-            # 3. ASK AI FOR THE PLAN (Multi-Modal)
-            
-            # Construct Message with Images if available
+            # 3. ANALYZE PAGE FOR MATH RULES
+            # Regex to find "mod N" or "modulo N"
+            mod_match = re.search(r'mod(?:ulo)?\s*(\d+)', page_text.lower() + evidence_text.lower())
+            mod_n = int(mod_match.group(1)) if mod_match else 0
+
+            # 4. ASK AI FOR THE PLAN
             messages = [
-                {"role": "system", "content": "You are a Logic Extraction Engine. Analyze instructions and evidence."}
+                {"role": "system", "content": "You are a Logic Extraction Engine."}
             ]
             
-            user_content = [
-                {"type": "text", "text": f"""
-                === USER IDENTITY ===
-                EMAIL: "{email}"
-                SECRET: "{student_secret}"
-                
-                === PAGE TEXT ===
-                {page_text}
-                
-                === AUDIO / EVIDENCE ===
-                {evidence_text}
-                
-                === MISSION ===
-                1. COMMANDS: If asked to "Craft a command" (uv/git/curl), output the command string.
-                   - NOTE: If the task is just "Calculate total and POST it", that is MATH, NOT a command.
-                2. MATH/DATA: If asked to sum/count/filter CSV, describe the logic.
-                   - NOTE: If asked for a "JSON array" of items, use "filter_list".
-                3. GENERAL: If asked for a color (from image), link, or code, extract it.
-                """}
-            ]
+            user_text_prompt = f"""
+            === USER IDENTITY ===
+            EMAIL: "{email}"
+            SECRET: "{student_secret}"
             
-            # Add images to prompt for Vision tasks (Heatmap)
+            === PAGE TEXT ===
+            {page_text}
+            
+            === AUDIO / EVIDENCE ===
+            {evidence_text}
+            
+            === MISSION ===
+            1. COMMANDS: "Craft a command" (uv/git/curl) -> Output command string.
+            2. LISTS: "Return a JSON array", "Filter rows" -> Use 'filter_list'.
+            3. MATH: "Sum", "Count", "Total" -> Use 'sum'/'count'.
+            4. GENERAL: "What is...", "Code?", "Color?" -> Extract exact value.
+            """
+            
+            user_content = [{"type": "text", "text": user_text_prompt}]
+            
+            # Add images for Vision
             for img_url in image_urls:
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": img_url}
-                })
+                user_content.append({"type": "image_url", "image_url": {"url": img_url}})
             
             user_content.append({"type": "text", "text": """
                 Return JSON ONLY:
                 {
                     "submission_url": "URL found on page",
-                    "generated_command": "Command string ONLY if specifically asked to CRAFT a command (otherwise null)",
+                    "generated_command": "Command string (or null)",
                     "general_answer": "Extracted text/color/link (or null)",
                     "math_operation": "sum/count/average/max/filter_list (or null)",
                     "math_filter": "greater_than/less_than/none",
                     "math_threshold": 12345 (number or null),
-                    "is_invoice_or_decimal": boolean,
-                    "use_mod_5": boolean
+                    "is_invoice_or_decimal": boolean
                 }
             """})
             
@@ -238,25 +270,18 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
             plan = json.loads(response.choices[0].message.content)
             print(f"    [AI Plan] {plan}")
 
-            # 4. EXECUTE THE PLAN
+            # 5. EXECUTE THE PLAN
             final_answer = None
             
-            # Priority A: CLI Command Generation (Strict check to avoid Invoice false positives)
             gen_cmd = plan.get("generated_command")
-            if gen_cmd and ("curl" in gen_cmd or "uv" in gen_cmd or "git" in gen_cmd):
+            if gen_cmd and ("curl" in gen_cmd or "uv" in gen_cmd or "git" in gen_cmd or "grep" in gen_cmd):
                 final_answer = gen_cmd
             
-            # Priority B: General Answer (Links, Colors, Phrases)
             elif plan.get("general_answer") and str(plan["general_answer"]).lower() not in ["hello", "your secret", "email", "code", "null"]:
-                # Fix relative paths for MD task
-                ans = plan["general_answer"]
-                if ans.endswith(".md") and ans.startswith("/"):
-                     # Sometimes server wants full url, sometimes relative. Usually relative is safer if extracted text.
-                     pass 
-                final_answer = ans
+                final_answer = plan["general_answer"]
             
-            # Priority C: Math / Data Logic
-            elif csv_data['numbers']:
+            # Fallback Logic
+            if not final_answer and csv_data['numbers']:
                 op = plan.get("math_operation", "sum") or "sum"
                 filt = plan.get("math_filter", "none")
                 thresh = plan.get("math_threshold")
@@ -265,30 +290,28 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                     try: thresh = float(str(thresh).replace(',',''))
                     except: thresh = None
                 
-                # Build operation key
                 op_key = f"{op}_{filt}"
                 if plan.get("is_invoice_or_decimal"): op_key += "_decimal"
-                if plan.get("use_mod_5") or "mod" in page_text.lower(): op_key += "_mod5" # Force check text for mod
-
-                final_answer = execute_logic(csv_data, op_key, thresh, email)
+                
+                final_answer = execute_logic(csv_data, op_key, thresh, email, mod_n)
                 print(f"    [Math] Executed {op} -> {final_answer}")
 
-            # Priority D: Fallback
+            # Ultimate Fallback
             if not final_answer:
                 if "secret" in page_text.lower() and "input" in page_text.lower():
                     final_answer = student_secret
                 else:
-                    final_answer = student_secret 
+                    final_answer = student_secret
 
-            # 5. SUBMIT (With Safety Check)
+            # 6. SUBMIT (Safety Checks)
             submission_url = plan.get("submission_url")
-            
             if submission_url:
                 if not submission_url.startswith("http"):
                     submission_url = urljoin(task_url, submission_url)
             
+            # Prevent infinite loop by redirecting self-submission to /submit
             parsed_task = urlparse(task_url)
-            parsed_sub = urlparse(submission_url)
+            parsed_sub = urlparse(submission_url) if submission_url else parsed_task
             
             if parsed_sub.path == parsed_task.path:
                 print("    ⚠️ AI tried to submit to the Task URL. Redirecting to /submit...")
@@ -313,7 +336,7 @@ async def solve_quiz_task(task_url: str, email: str, student_secret: str):
                         await browser.close()
                         await solve_quiz_task(res_json["url"], email, student_secret)
                 except Exception:
-                    print(f"    ❌ Server returned non-JSON error. Status: {res.status_code}")
+                    print(f"    ❌ Server returned non-JSON. Status: {res.status_code}")
                     print(f"    Response Body: {res.text[:300]}")
 
         except Exception as e:
